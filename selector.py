@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import math
 import re
@@ -35,34 +34,6 @@ DIALECT_OPTIMIZER_METHODS = {
 
 def duration_ms(seconds: float) -> int:
     return math.floor(seconds * 1000 + 0.5)
-
-
-def strip_docstrings(tree: ast.AST) -> ast.AST:
-    """Remove module/class/function docstrings so docstring-only diffs compare equal."""
-    for node in ast.walk(tree):
-        if isinstance(
-            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
-        ):
-            if (
-                node.body
-                and isinstance(node.body[0], ast.Expr)
-                and isinstance(node.body[0].value, ast.Constant)
-                and isinstance(node.body[0].value.value, str)
-            ):
-                node.body.pop(0)
-    return tree
-
-
-def is_semantic_py_change(orig_source: str, patched_source: str) -> bool:
-    """Return False if changes are purely comments, docstrings, or whitespace."""
-    try:
-        t1 = strip_docstrings(ast.parse(orig_source))
-        t2 = strip_docstrings(ast.parse(patched_source))
-        return ast.dump(t1, include_attributes=False) != ast.dump(
-            t2, include_attributes=False
-        )
-    except SyntaxError:
-        return True
 
 
 def parse_unified_diff(patch_text: str) -> list[dict]:
@@ -154,39 +125,6 @@ def align_hunk_span(src_lines: list[str], hunk: dict) -> tuple[int, int]:
                     return max(1, cand + 1 - 3), min(len(src_lines), cand + 1 + n + 3)
 
     return old_s, old_e
-
-
-def apply_hunks_to_text(orig_text: str, hunks: list[dict]) -> str | None:
-    """Apply parsed unified diff hunks to orig_text in memory."""
-    src_lines = orig_text.splitlines(keepends=True)
-    out: list[str] = []
-    idx = 0
-    for h in hunks:
-        target_idx = max(0, h["old_start"] - 1)
-        if target_idx < idx or target_idx > len(src_lines):
-            return None
-        out.extend(src_lines[idx:target_idx])
-        idx = target_idx
-        for hl in h["lines"]:
-            if not hl:
-                continue
-            tag = hl[0]
-            content = hl[1:]
-            if tag == " ":
-                if idx < len(src_lines):
-                    out.append(src_lines[idx])
-                    idx += 1
-                else:
-                    out.append(content + "\n")
-            elif tag == "-":
-                idx += 1
-            elif tag == "+":
-                out.append(content + "\n")
-            elif tag == "\\":
-                if out and out[-1].endswith("\n"):
-                    out[-1] = out[-1][:-1]
-    out.extend(src_lines[idx:])
-    return "".join(out)
 
 
 def range_intersects(ranges: list[list[int]], q_start: int, q_end: int) -> bool:
@@ -313,6 +251,7 @@ def main() -> None:
 
     ast_scopes: dict[str, list[dict]] = cov_data["ast_scopes"]
     import_lines: dict[str, list[list[int]]] = cov_data["import_lines"]
+    file_import_lines: dict[str, dict[str, list[list[int]]]] = cov_data.get("file_import_lines", {})
 
     patch_files = sorted((DATA_DIR / "commits").glob("*.patch"))
     out_lines: list[str] = []
@@ -323,7 +262,6 @@ def main() -> None:
         file_diffs = parse_unified_diff(patch_text)
 
         selected: set[int] = set()
-        any_semantic_change = False
         need_serde_sweep = False
 
         for fd in file_diffs:
@@ -335,16 +273,6 @@ def main() -> None:
             if rel_path.endswith(".py"):
                 repo_file = REPO_DIR / rel_path
                 orig_text = repo_file.read_text("utf-8") if repo_file.exists() else ""
-                patched_text = apply_hunks_to_text(orig_text, fd["hunks"])
-
-                if (
-                    orig_text
-                    and patched_text is not None
-                    and not is_semantic_py_change(orig_text, patched_text)
-                ):
-                    continue
-
-                any_semantic_change = True
                 src_lines_no_nl = orig_text.splitlines() if orig_text else []
 
                 # Direct test file edit
@@ -353,17 +281,23 @@ def main() -> None:
                     if file_nums:
                         scopes = ast_scopes.get(rel_path, [])
                         matched_methods: set[str] = set()
+                        hit_outside_func = False
                         for h in fd["hunks"]:
                             s, e = align_hunk_span(src_lines_no_nl, h)
+                            matched_hunk = False
                             for sc in scopes:
                                 if sc["kind"] == "func" and not (
                                     sc["end"] < s or sc["start"] > e
                                 ):
                                     matched_methods.add(sc["name"])
-                        if matched_methods:
+                                    matched_hunk = True
+                            if not matched_hunk:
+                                hit_outside_func = True
+                        if matched_methods and not hit_outside_func:
                             for t in tests_data:
                                 if t["file"] == rel_path and any(
-                                    t["id"].endswith("." + m) for m in matched_methods
+                                    t["id"].endswith("::" + m) or t["id"].endswith("." + m)
+                                    for m in matched_methods
                                 ):
                                     selected.add(t["number"])
                         else:
@@ -380,7 +314,6 @@ def main() -> None:
                     selected.update(nums_by_method.get("test_execute_subqueries", []))
                     selected.update(nums_by_method.get("test_execute_tpcds", []))
 
-                # Add targeted cross-dialect optimizer checks for known cross-dialect rules
                 if is_dialect_module(rel_path):
                     stem = Path(rel_path).stem.lower()
                     for m in DIALECT_OPTIMIZER_METHODS.get(stem, ()):
@@ -396,8 +329,8 @@ def main() -> None:
 
                 for h in fd["hunks"]:
                     old_s, old_e = align_hunk_span(src_lines_no_nl, h)
-                    q_s = max(1, old_s - 4)
-                    q_e = old_e + 4
+                    q_s = max(1, old_s - 6)
+                    q_e = old_e + 6
                     query_intervals.append((q_s, q_e))
 
                     if imp_ranges and range_intersects(imp_ranges, q_s, q_e):
@@ -420,52 +353,61 @@ def main() -> None:
                                 break
                         if enclosing_cls is not None:
                             query_intervals.append(
-                                (enclosing_cls["start"], enclosing_cls["start"] + 15)
+                                (enclosing_cls["start"], enclosing_cls["start"] + 25)
                             )
                             top_level_change = True
                         else:
                             top_level_change = True
 
+                # If import-time lines changed, include 1 test from each test file that imports those lines
+                # (if module import fails, any test in that file catches it)
                 if hit_import_time:
                     for cp in candidate_paths:
-                        for tnum, _ in file_to_test_ranges.get(cp, []):
-                            if ms_by_num[tnum] < 10000:
+                        for test_file, imp_map in file_import_lines.items():
+                            f_ranges = imp_map.get(cp, [])
+                            if f_ranges and any(
+                                range_intersects(f_ranges, qs, qe) for qs, qe in query_intervals
+                            ):
+                                tf_nums = tests_by_file.get(test_file, [])
+                                if tf_nums:
+                                    fastest = min(tf_nums, key=lambda n: ms_by_num[n])
+                                    selected.add(fastest)
+
+                matched_any_line = False
+                for cp in candidate_paths:
+                    candidates = file_to_test_ranges.get(cp, [])
+                    for tnum, ranges in candidates:
+                        for qs, qe in query_intervals:
+                            if range_intersects(ranges, qs, qe):
                                 selected.add(tnum)
+                                matched_any_line = True
+                                break
+                    if top_level_change and candidates:
+                        for tnum, ranges in candidates:
+                            if range_intersects(ranges, 1, 200):
+                                selected.add(tnum)
+                                matched_any_line = True
+
+                # Always run fast tests in directly related test files as safety net
+                if is_dialect_module(rel_path):
+                    stem = Path(rel_path).stem.lower()
+                    dial_tf = f"tests/dialects/test_{stem}.py"
+                    if dial_tf in tests_by_file:
+                        if not matched_any_line:
+                            selected.update(tests_by_file[dial_tf])
+                        else:
+                            selected.update(
+                                n for n in tests_by_file[dial_tf] if ms_by_num[n] < 3000
+                            )
+                elif not matched_any_line:
                     for tf in rel_tfs:
+                        selected.update(unmapped_by_file.get(tf, []))
                         selected.update(
                             n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 10000
                         )
-                else:
-                    matched_any_line = False
-                    for cp in candidate_paths:
-                        candidates = file_to_test_ranges.get(cp, [])
-                        for tnum, ranges in candidates:
-                            for qs, qe in query_intervals:
-                                if range_intersects(ranges, qs, qe):
-                                    selected.add(tnum)
-                                    matched_any_line = True
-                                    break
-                        if top_level_change and candidates:
-                            for tnum, ranges in candidates:
-                                if range_intersects(ranges, 1, 180):
-                                    selected.add(tnum)
-                                    matched_any_line = True
-
-                    if is_dialect_module(rel_path) and not matched_any_line:
-                        stem = Path(rel_path).stem.lower()
-                        dial_tf = f"tests/dialects/test_{stem}.py"
-                        if dial_tf in tests_by_file:
-                            selected.update(tests_by_file[dial_tf])
-                    elif not matched_any_line:
-                        for tf in rel_tfs:
-                            selected.update(unmapped_by_file.get(tf, []))
-                            selected.update(
-                                n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 10000
-                            )
 
             # 2. Handle fixture / SQL / data files
             else:
-                any_semantic_change = True
                 if rel_path in fixture_to_tests:
                     selected.update(fixture_to_tests[rel_path])
                 bname = Path(rel_path).name
@@ -504,9 +446,7 @@ def main() -> None:
                     if stem_base and stem_base in tfile.lower():
                         selected.update(tnums)
 
-        if not any_semantic_change:
-            workers = []
-        elif need_serde_sweep:
+        if need_serde_sweep:
             serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", [])}
             for tf in ("tests/test_serde.py", "tests/test_optimizer.py", "tests/test_expressions.py"):
                 serde_set.update(tests_by_file.get(tf, []))

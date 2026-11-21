@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import importlib
 import io
 import json
 import os
@@ -70,8 +71,21 @@ def compress_lines(lines: set[int]) -> list[list[int]]:
     return ranges
 
 
+def case_to_pytest_id(case: unittest.TestCase, repo_root: Path) -> str:
+    cls = case.__class__
+    mod = sys.modules.get(cls.__module__)
+    if mod and getattr(mod, "__file__", None):
+        try:
+            rel = Path(mod.__file__).resolve().relative_to(repo_root).as_posix()
+            return f"{rel}::{cls.__qualname__}::{case._testMethodName}"
+        except ValueError:
+            pass
+    return case.id()
+
+
 def main() -> None:
     t0 = time.time()
+    os.environ["SKIP_INTEGRATION"] = "0"
     repo_root = Path(sys.argv[1]).resolve()
     out_path = Path(sys.argv[2]).resolve()
     sys.path.insert(0, str(repo_root))
@@ -142,6 +156,26 @@ def main() -> None:
     sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.LINE)
     sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.LINE, on_line)
 
+    # Trace import-time sqlglot execution per test module
+    file_import_lines: dict[str, dict[str, list[list[int]]]] = {}
+    for test_py in sorted((repo_root / "tests").rglob("test_*.py")):
+        rel_test = test_py.relative_to(repo_root).as_posix()
+        mod_name = rel_test[:-3].replace("/", ".")
+        mod_lines: dict[str, set[int]] = defaultdict(set)
+        active_lines = mod_lines
+        seen_lines_this_phase.clear()
+        sys.monitoring.restart_events()
+        try:
+            importlib.import_module(mod_name)
+        except Exception:
+            pass
+        for k, v in mod_lines.items():
+            import_lines[k].update(v)
+        if mod_lines:
+            file_import_lines[rel_test] = {
+                k: compress_lines(v) for k, v in sorted(mod_lines.items())
+            }
+
     print("Discovering tests...", file=sys.stderr, flush=True)
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir=str(repo_root / "tests"), top_level_dir=str(repo_root))
@@ -168,8 +202,8 @@ def main() -> None:
     for idx, case in enumerate(cases, start=1):
         if idx % 300 == 0 or idx == total:
             print(f"  [{idx}/{total}] ({time.time() - t0:.1f}s)", file=sys.stderr, flush=True)
-        test_id = case.id()
-        current_test_name = test_id
+        pytest_id = case_to_pytest_id(case, repo_root)
+        current_test_name = pytest_id
         test_start_time = time.time()
         cls = case.__class__
 
@@ -211,7 +245,7 @@ def main() -> None:
                 merged_lines[rel] = compress_lines(combined)
 
         merged_fixtures = sorted(t_fixtures | cls_fixtures)
-        test_coverage[test_id] = {
+        test_coverage[pytest_id] = {
             "lines": merged_lines,
             "fixtures": merged_fixtures,
         }
@@ -231,6 +265,7 @@ def main() -> None:
 
     payload = {
         "import_lines": {k: compress_lines(v) for k, v in sorted(import_lines.items())},
+        "file_import_lines": file_import_lines,
         "import_fixtures": sorted(import_fixtures),
         "ast_scopes": extract_ast_scopes(repo_root),
         "tests": test_coverage,
