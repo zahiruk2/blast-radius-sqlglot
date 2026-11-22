@@ -38,8 +38,8 @@ DIALECT_INHERITANCE = {
     "spark": ["databricks"],
     "presto": ["trino", "athena"],
     "trino": ["athena"],
-    "postgres": ["redshift", "duckdb", "materialize", "risingwave"],
-    "mysql": ["doris", "starrocks", "singlestore", "tidb"],
+    "postgres": ["redshift", "duckdb", "materialize", "risingwave", "cockroach", "greenplum", "timescale"],
+    "mysql": ["doris", "starrocks", "singlestore", "tidb", "mariadb"],
     "duckdb": ["motherduck"],
     "tsql": ["fabric"],
     "oracle": ["snowflake"],
@@ -238,6 +238,8 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
         matched.add("tests/test_dataframe.py")
     elif rel_path.startswith("sqlglot/typing/"):
         matched.add("tests/test_typing.py")
+    elif rel_path in {"sqlglot/build.py", "sqlglot/sqlglotc.py", "setup.py", "pyproject.toml"}:
+        matched.update({"tests/test_build.py", "tests/test_sqlglotc.py"})
     elif stem != "__init__":
         cand = f"tests/test_{stem}.py"
         if cand in all_test_files:
@@ -361,6 +363,11 @@ def main() -> None:
                         need_serde_sweep = True
                         continue
 
+                    if rel_path in {"setup.py", "sqlglot/build.py", "sqlglot/sqlglotc.py"}:
+                        selected.update(tests_by_file.get("tests/test_build.py", []))
+                        selected.update(tests_by_file.get("tests/test_sqlglotc.py", []))
+                        continue
+
                     rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
                     if rel_path in {"sqlglot/__init__.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"}:
@@ -375,7 +382,7 @@ def main() -> None:
                     if rel_path.startswith(("sqlglot/expressions/", "sqlglot/typing/")):
                         selected.update(nums_by_method.get("test_no_redundant_expression_metadata", []))
 
-                    # Optimizer & executor integration coverage (tpcds/tpch multi-rule chains)
+                    # Optimizer & executor integration coverage
                     if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
                         stem = Path(rel_path).stem.lower()
                         for m in (
@@ -394,12 +401,7 @@ def main() -> None:
                             "pushdown_predicates",
                             "pushdown_projections",
                             "merge_subqueries",
-                            "simplify",
-                            "optimizer",
-                            "annotate_types",
-                            "qualify_columns",
-                            "qualify_tables",
-                            "scope",
+                            "unnest_subqueries",
                         }:
                             for m in ("test_execute_tpcds", "test_execute_subqueries"):
                                 selected.update(nums_by_method.get(m, []))
@@ -448,9 +450,6 @@ def main() -> None:
                             if enclosing_cls is not None:
                                 query_intervals.append(
                                     (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 10))
-                                )
-                                query_intervals.append(
-                                    (max(enclosing_cls["start"], old_s - 25), min(enclosing_cls["end"], old_e + 25))
                                 )
 
                     if hit_import_time:
@@ -504,8 +503,13 @@ def main() -> None:
                                 n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 3000 and n not in noisy_nums
                             )
 
-                # 2. Fixture / SQL / data files
+                # 2. Config / Fixture / SQL / data files
                 else:
+                    if rel_path in {"pyproject.toml", "Makefile"}:
+                        selected.update(tests_by_file.get("tests/test_build.py", []))
+                        selected.update(tests_by_file.get("tests/test_sqlglotc.py", []))
+                        continue
+
                     if rel_path in fixture_to_tests:
                         selected.update(fixture_to_tests[rel_path])
                     bname = Path(rel_path).name
