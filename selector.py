@@ -380,6 +380,8 @@ def main() -> None:
                         selected.update(nums_by_method.get("test_cache_does_not_retain_queries", []))
 
                     if rel_path.startswith(("sqlglot/expressions/", "sqlglot/typing/")):
+                        selected.update(tests_by_file.get("tests/test_serde.py", []))
+                        selected.update(nums_by_method.get("test_identity", []))
                         selected.update(nums_by_method.get("test_no_redundant_expression_metadata", []))
 
                     # Optimizer & executor integration coverage
