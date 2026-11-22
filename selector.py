@@ -380,22 +380,14 @@ def main() -> None:
                         selected.update(nums_by_method.get("test_cache_does_not_retain_queries", []))
 
                     if rel_path.startswith(("sqlglot/expressions/", "sqlglot/typing/")):
+                        selected.update(nums_by_method.get("test_no_redundant_expression_metadata", []))
                         selected.update(tests_by_file.get("tests/test_serde.py", []))
                         selected.update(nums_by_method.get("test_identity", []))
-                        selected.update(nums_by_method.get("test_no_redundant_expression_metadata", []))
 
-                    # Optimizer & executor integration coverage
+                    # Optimizer & executor integration coverage (only run heavy TPC-DS/TPC-H on join/subquery/executor rules)
                     if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
                         stem = Path(rel_path).stem.lower()
-                        for m in (
-                            "test_optimize",
-                            "test_tpcds",
-                            "test_tpch",
-                            "test_execute_tpch",
-                            "test_optimized_tpch",
-                            "test_agg_order",
-                            f"test_{stem}",
-                        ):
+                        for m in ("test_optimize", "test_tpch", f"test_{stem}"):
                             selected.update(nums_by_method.get(m, []))
                         if rel_path.startswith("sqlglot/executor/") or stem in {
                             "eliminate_joins",
@@ -405,7 +397,14 @@ def main() -> None:
                             "merge_subqueries",
                             "unnest_subqueries",
                         }:
-                            for m in ("test_execute_tpcds", "test_execute_subqueries"):
+                            for m in (
+                                "test_execute_tpcds",
+                                "test_execute_tpch",
+                                "test_optimized_tpch",
+                                "test_tpcds",
+                                "test_execute_subqueries",
+                                "test_agg_order",
+                            ):
                                 selected.update(nums_by_method.get(m, []))
 
                     # General dialect optimizer/transpile coverage
@@ -454,6 +453,9 @@ def main() -> None:
                                     (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 10))
                                 )
 
+                    # CRITICAL FIX: Class-level dicts/tuples/regexes execute at import time!
+                    # Include ALL tests (< 1500 ms) in every test file that imported the edited line,
+                    # NOT just the single fastest 1 ms test!
                     if hit_import_time:
                         selected.update(nums_by_method.get("test_lazy_load", []))
                         for cp in candidate_paths:
@@ -462,9 +464,11 @@ def main() -> None:
                                 if f_ranges and any(
                                     range_intersects(f_ranges, qs, qe) for qs, qe in query_intervals
                                 ):
-                                    tf_nums = [n for n in tests_by_file.get(test_file, []) if n not in noisy_nums]
-                                    if tf_nums:
-                                        selected.add(min(tf_nums, key=lambda n: ms_by_num[n]))
+                                    selected.update(
+                                        n
+                                        for n in tests_by_file.get(test_file, [])
+                                        if ms_by_num[n] < 1500 and n not in noisy_nums
+                                    )
 
                     for cp in candidate_paths:
                         for cls_prefix, cls_map in class_setup_lines.items():
