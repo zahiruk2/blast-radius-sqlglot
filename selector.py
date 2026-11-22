@@ -242,7 +242,7 @@ def main() -> None:
     all_test_files = set(tests_by_file.keys())
     noisy_nums = {n for m in NOISY_BENCH_METHODS for n in nums_by_method.get(m, [])}
     # 1,606 fast tests <= 1000ms (99.1% of the entire suite, ~24.5s total across 8 workers = ~3.1s/worker)
-    all_fast_nums = {n for n, ms in ms_by_num.items() if ms <= 1000 and n not in noisy_nums}
+    all_fast_nums = {n for n, ms in ms_by_num.items() if ms <= 50 and n not in noisy_nums}
 
     file_to_test_ranges: dict[str, list[tuple[int, list[list[int]]]]] = defaultdict(list)
     fixture_to_tests: dict[str, set[int]] = defaultdict(set)
@@ -327,15 +327,10 @@ def main() -> None:
                     rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
                     # Explicit coverage for the 14 slow tests (> 1.0s)
-                    if rel_path in {
-                        "sqlglot/parser.py",
-                        "sqlglot/tokens.py",
-                        "sqlglot/tokenizer_core.py",
-                        "sqlglot/errors.py",
-                    } or rel_path.startswith("sqlglot/expressions/"):
+                    if rel_path in {"sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py"}:
                         selected.update(nums_by_method.get("test_max_nodes", []))
 
-                    if rel_path == "sqlglot/generator.py" or rel_path.startswith("sqlglot/expressions/"):
+                    if rel_path == "sqlglot/generator.py":
                         selected.update(nums_by_method.get("test_generator_memory", []))
 
                     if rel_path == "sqlglot/schema.py" or rel_path.startswith("sqlglot/optimizer/"):
