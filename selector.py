@@ -54,6 +54,26 @@ def duration_ms(seconds: float) -> int:
     return math.floor(seconds * 1000 + 0.5)
 
 
+def is_comment_only_py_diff(file_diffs: list[dict]) -> bool:
+    """Return True if every changed line across all .py hunks is whitespace or a # comment."""
+    saw_change = False
+    for fd in file_diffs:
+        paths = [p for p in (fd["old_path"], fd["new_path"]) if p]
+        if not paths or any(not p.endswith(".py") for p in paths):
+            return False
+        for h in fd["hunks"]:
+            for hl in h["lines"]:
+                if not hl or hl[0] not in ("+", "-"):
+                    continue
+                content = hl[1:].strip()
+                if not content:
+                    continue
+                saw_change = True
+                if not content.startswith("#"):
+                    return False
+    return saw_change
+
+
 def parse_unified_diff(patch_text: str) -> list[dict]:
     files: list[dict] = []
     cur: dict | None = None
@@ -279,6 +299,12 @@ def main() -> None:
         patch_text = patch_path.read_text("utf-8", errors="replace")
         file_diffs = parse_unified_diff(patch_text)
 
+        if is_comment_only_py_diff(file_diffs):
+            out_lines.append(
+                json.dumps({"commit": commit_id, "workers": []}, separators=(",", ":"))
+            )
+            continue
+
         selected: set[int] = set()
         need_serde_sweep = False
 
@@ -337,19 +363,45 @@ def main() -> None:
 
                     rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
+                    if rel_path in {"sqlglot/__init__.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"}:
+                        selected.update(nums_by_method.get("test_lazy_load", []))
+
                     if rel_path in {"sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py"}:
                         selected.update(nums_by_method.get("test_max_nodes", []))
 
                     if rel_path == "sqlglot/schema.py":
                         selected.update(nums_by_method.get("test_cache_does_not_retain_queries", []))
 
-                    # Targeted optimizer & executor integration coverage
+                    if rel_path.startswith(("sqlglot/expressions/", "sqlglot/typing/")):
+                        selected.update(nums_by_method.get("test_no_redundant_expression_metadata", []))
+
+                    # Optimizer & executor integration coverage (tpcds/tpch multi-rule chains)
                     if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
                         stem = Path(rel_path).stem.lower()
-                        for m in ("test_optimize", f"test_{stem}"):
+                        for m in (
+                            "test_optimize",
+                            "test_tpcds",
+                            "test_tpch",
+                            "test_execute_tpch",
+                            "test_optimized_tpch",
+                            "test_agg_order",
+                            f"test_{stem}",
+                        ):
                             selected.update(nums_by_method.get(m, []))
-                        if rel_path.startswith("sqlglot/executor/"):
-                            for m in ("test_tpcds", "test_tpch", "test_execute_tpch", "test_optimized_tpch", "test_agg_order"):
+                        if rel_path.startswith("sqlglot/executor/") or stem in {
+                            "eliminate_joins",
+                            "optimize_joins",
+                            "pushdown_predicates",
+                            "pushdown_projections",
+                            "merge_subqueries",
+                            "simplify",
+                            "optimizer",
+                            "annotate_types",
+                            "qualify_columns",
+                            "qualify_tables",
+                            "scope",
+                        }:
+                            for m in ("test_execute_tpcds", "test_execute_subqueries"):
                                 selected.update(nums_by_method.get(m, []))
 
                     # General dialect optimizer/transpile coverage
@@ -402,6 +454,7 @@ def main() -> None:
                                 )
 
                     if hit_import_time:
+                        selected.update(nums_by_method.get("test_lazy_load", []))
                         for cp in candidate_paths:
                             for test_file, imp_map in file_import_lines.items():
                                 f_ranges = imp_map.get(cp, [])
@@ -437,16 +490,18 @@ def main() -> None:
                     for tf in rel_tfs:
                         selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
 
-                    if not matched_any_line:
+                    if not matched_any_line and not selected:
                         if is_dialect_module(rel_path):
                             stem = Path(rel_path).stem.lower()
                             for d in [stem, *DIALECT_INHERITANCE.get(stem, ())]:
                                 dial_tf = f"tests/dialects/test_{d}.py"
                                 if dial_tf in tests_by_file:
-                                    selected.update(n for n in tests_by_file[dial_tf] if n not in noisy_nums)
+                                    selected.update(
+                                        n for n in tests_by_file[dial_tf] if ms_by_num[n] < 3000 and n not in noisy_nums
+                                    )
                         for tf in rel_tfs:
                             selected.update(
-                                n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 8000 and n not in noisy_nums
+                                n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 3000 and n not in noisy_nums
                             )
 
                 # 2. Fixture / SQL / data files
