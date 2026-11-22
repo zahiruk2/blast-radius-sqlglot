@@ -32,6 +32,19 @@ DIALECT_OPTIMIZER_METHODS = {
     },
 }
 
+DIALECT_INHERITANCE = {
+    "hive": ["spark2", "spark", "databricks"],
+    "spark2": ["spark", "databricks"],
+    "spark": ["databricks"],
+    "presto": ["trino", "athena"],
+    "trino": ["athena"],
+    "postgres": ["redshift", "duckdb", "materialize", "risingwave"],
+    "mysql": ["doris", "starrocks", "singlestore", "tidb"],
+    "duckdb": ["motherduck"],
+    "tsql": ["fabric"],
+    "oracle": ["snowflake"],
+}
+
 NOISY_BENCH_METHODS = {
     "test_generator_memory",
 }
@@ -182,9 +195,10 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
     matched: set[str] = set()
     stem = Path(rel_path).stem.lower()
     if is_dialect_module(rel_path):
-        cand = f"tests/dialects/test_{stem}.py"
-        if cand in all_test_files:
-            matched.add(cand)
+        for d in [stem, *DIALECT_INHERITANCE.get(stem, ())]:
+            cand = f"tests/dialects/test_{d}.py"
+            if cand in all_test_files:
+                matched.add(cand)
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
     elif rel_path in {"sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py"}:
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
@@ -239,7 +253,8 @@ def main() -> None:
         tid = t["id"]
         num = t["number"]
         entry = cov_data["tests"].get(tid)
-        if not entry:
+        # Treat SKIP_INTEGRATION / 0-line tests as unmapped so they are never silently dropped!
+        if not entry or (not entry.get("lines") and not entry.get("fixtures")):
             unmapped_by_file[t["file"]].append(num)
             continue
         for rel_file, ranges in entry["lines"].items():
@@ -373,7 +388,6 @@ def main() -> None:
                                 query_intervals.append(
                                     (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 15))
                                 )
-                                # Catch multi-line class dicts (FUNCTIONS, TRANSFORMS, TYPE_MAPPING, KEYWORDS)
                                 query_intervals.append(
                                     (max(enclosing_cls["start"], old_s - 80), min(enclosing_cls["end"], old_e + 80))
                                 )
@@ -427,12 +441,13 @@ def main() -> None:
                     if not matched_any_line:
                         if is_dialect_module(rel_path):
                             stem = Path(rel_path).stem.lower()
-                            dial_tf = f"tests/dialects/test_{stem}.py"
-                            if dial_tf in tests_by_file:
-                                selected.update(n for n in tests_by_file[dial_tf] if n not in noisy_nums)
+                            for d in [stem, *DIALECT_INHERITANCE.get(stem, ())]:
+                                dial_tf = f"tests/dialects/test_{d}.py"
+                                if dial_tf in tests_by_file:
+                                    selected.update(n for n in tests_by_file[dial_tf] if n not in noisy_nums)
                         for tf in rel_tfs:
                             selected.update(
-                                n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 5000 and n not in noisy_nums
+                                n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 8000 and n not in noisy_nums
                             )
 
                 # 2. Fixture / SQL / data files
