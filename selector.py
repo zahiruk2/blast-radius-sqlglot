@@ -185,7 +185,11 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
             matched.add(cand)
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
     elif rel_path.startswith("sqlglot/optimizer/"):
-        matched.add("tests/test_optimizer.py")
+        matched.update({
+            "tests/test_optimizer.py",
+            "tests/test_optimize_cross_joins.py",
+            "tests/test_simplify_between.py",
+        })
         cand = f"tests/optimizer/test_{stem}.py"
         if cand in all_test_files:
             matched.add(cand)
@@ -299,7 +303,7 @@ def main() -> None:
 
                 rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
-            # General optimizer & executor integration coverage (tpcds/tpch weren't line-traced)
+                # General optimizer & executor integration coverage (tpcds/tpch weren't line-traced)
                 if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
                     stem = Path(rel_path).stem.lower()
                     for m in ("test_optimize", "test_tpcds", "test_tpch", f"test_{stem}"):
@@ -315,6 +319,7 @@ def main() -> None:
                     }:
                         for m in ("test_execute_tpcds", "test_execute_tpch", "test_execute_subqueries"):
                             selected.update(nums_by_method.get(m, []))
+
                 # General dialect optimizer/transpile coverage
                 if is_dialect_module(rel_path):
                     stem = Path(rel_path).stem.lower()
@@ -400,6 +405,17 @@ def main() -> None:
                                 selected.add(tnum)
                                 matched_any_line = True
 
+                for tf in rel_tfs:
+                    selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
+                if rel_path in {
+                    "sqlglot/parser.py",
+                    "sqlglot/generator.py",
+                    "sqlglot/tokens.py",
+                    "sqlglot/tokenizer_core.py",
+                } or rel_path.startswith("sqlglot/expressions/"):
+                    selected.update(unmapped_by_file.get("tests/test_parser.py", []))
+                    selected.update(unmapped_by_file.get("tests/test_optimizer.py", []))
+
                 if not matched_any_line:
                     if is_dialect_module(rel_path):
                         stem = Path(rel_path).stem.lower()
@@ -407,7 +423,6 @@ def main() -> None:
                         if dial_tf in tests_by_file:
                             selected.update(n for n in tests_by_file[dial_tf] if n not in noisy_nums)
                     for tf in rel_tfs:
-                        selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
                         selected.update(
                             n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 5000 and n not in noisy_nums
                         )
