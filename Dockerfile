@@ -5,6 +5,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+
 # Clone sqlglot and find the exact commit containing blob fed01b2 (from sqlglot/dialects/dialect.py)
 RUN git clone https://github.com/tobymao/sqlglot.git /app/repo \
     && cd /app/repo \

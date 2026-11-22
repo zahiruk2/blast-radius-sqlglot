@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ultra-fast build-time dynamic coverage + fixture + AST scope mapper for sqlglot."""
+"""Fast 4-worker sys.monitoring coverage + fixture + AST scope mapper for sqlglot."""
 
 from __future__ import annotations
 
@@ -10,11 +10,13 @@ import io
 import json
 import os
 import sys
-import threading
 import time
 import unittest
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+SKIP_SLOW_METHODS = {"test_execute_tpcds", "test_execute_tpch"}
 
 
 def collect_unittest_cases(suite: unittest.TestSuite) -> list[unittest.TestCase]:
@@ -83,22 +85,29 @@ def case_to_pytest_id(case: unittest.TestCase, repo_root: Path) -> str:
     return case.id()
 
 
-def main() -> None:
-    t0 = time.time()
-    os.environ["SKIP_INTEGRATION"] = "0"
-    repo_root = Path(sys.argv[1]).resolve()
-    out_path = Path(sys.argv[2]).resolve()
+def class_to_pytest_prefix(cls: type, repo_root: Path) -> str:
+    mod = sys.modules.get(cls.__module__)
+    if mod and getattr(mod, "__file__", None):
+        try:
+            rel = Path(mod.__file__).resolve().relative_to(repo_root).as_posix()
+            return f"{rel}::{cls.__qualname__}::"
+        except ValueError:
+            pass
+    return f"{cls.__module__}.{cls.__qualname__}."
+
+
+def trace_test_files(args: tuple[str, list[str]]) -> dict:
+    repo_str, test_rel_paths = args
+    os.environ["SKIP_INTEGRATION"] = "1"
+    repo_root = Path(repo_str).resolve()
     sys.path.insert(0, str(repo_root))
     os.chdir(repo_root)
 
     repo_prefix = str(repo_root) + os.sep
     repo_prefix_len = len(repo_prefix)
 
-    import_lines: dict[str, set[int]] = defaultdict(set)
-    import_fixtures: set[str] = set()
-
-    active_lines: dict[str, set[int]] = import_lines
-    active_fixtures: set[str] = import_fixtures
+    active_lines: dict[str, set[int]] = defaultdict(set)
+    active_fixtures: set[str] = set()
 
     orig_builtins_open = builtins.open
     orig_io_open = io.open
@@ -134,7 +143,7 @@ def main() -> None:
         rel = code_to_rel.get(code)
         if rel is None:
             if code in code_to_rel:
-                return sys.monitoring.DISABLE
+                return None
             fn = code.co_filename
             if fn.startswith(repo_prefix):
                 rel = fn[repo_prefix_len:].replace(os.sep, "/")
@@ -142,10 +151,10 @@ def main() -> None:
                     code_to_rel[code] = rel
                 else:
                     code_to_rel[code] = None
-                    return sys.monitoring.DISABLE
+                    return None
             else:
                 code_to_rel[code] = None
-                return sys.monitoring.DISABLE
+                return None
         key = (code, line_number)
         if key in seen_lines_this_phase:
             return sys.monitoring.DISABLE
@@ -156,13 +165,15 @@ def main() -> None:
     sys.monitoring.set_events(TOOL_ID, sys.monitoring.events.LINE)
     sys.monitoring.register_callback(TOOL_ID, sys.monitoring.events.LINE, on_line)
 
-    # Trace import-time sqlglot execution per test module
+    import_lines: dict[str, set[int]] = defaultdict(set)
+    import_fixtures: set[str] = set()
     file_import_lines: dict[str, dict[str, list[list[int]]]] = {}
-    for test_py in sorted((repo_root / "tests").rglob("test_*.py")):
-        rel_test = test_py.relative_to(repo_root).as_posix()
+
+    for rel_test in test_rel_paths:
         mod_name = rel_test[:-3].replace("/", ".")
         mod_lines: dict[str, set[int]] = defaultdict(set)
         active_lines = mod_lines
+        active_fixtures = import_fixtures
         seen_lines_this_phase.clear()
         sys.monitoring.restart_events()
         try:
@@ -176,35 +187,22 @@ def main() -> None:
                 k: compress_lines(v) for k, v in sorted(mod_lines.items())
             }
 
-    print("Discovering tests...", file=sys.stderr, flush=True)
     loader = unittest.TestLoader()
-    suite = loader.discover(start_dir=str(repo_root / "tests"), top_level_dir=str(repo_root))
+    suite = unittest.TestSuite()
+    for rel_test in test_rel_paths:
+        mod_name = rel_test[:-3].replace("/", ".")
+        if mod_name in sys.modules:
+            suite.addTests(loader.loadTestsFromModule(sys.modules[mod_name]))
+
     cases = collect_unittest_cases(suite)
-    total = len(cases)
-    print(f"Found {total} tests. Tracing...", file=sys.stderr, flush=True)
-
-    current_test_name = "init"
-    test_start_time = time.time()
-
-    def watchdog() -> None:
-        while True:
-            time.sleep(2.0)
-            elapsed = time.time() - test_start_time
-            if elapsed > 4.0 and current_test_name != "done":
-                print(f"  [slow >{elapsed:.0f}s] {current_test_name}", file=sys.stderr, flush=True)
-
-    threading.Thread(target=watchdog, daemon=True).start()
-
     test_coverage: dict[str, dict] = {}
-    class_setup_cache: dict[type, tuple[dict[str, set[int]], set[str]]] = {}
+    class_setup_map: dict[str, dict[str, list[list[int]]]] = {}
     seen_classes: set[type] = set()
 
-    for idx, case in enumerate(cases, start=1):
-        if idx % 300 == 0 or idx == total:
-            print(f"  [{idx}/{total}] ({time.time() - t0:.1f}s)", file=sys.stderr, flush=True)
+    for case in cases:
+        if case._testMethodName in SKIP_SLOW_METHODS:
+            continue
         pytest_id = case_to_pytest_id(case, repo_root)
-        current_test_name = pytest_id
-        test_start_time = time.time()
         cls = case.__class__
 
         if cls not in seen_classes:
@@ -220,7 +218,11 @@ def main() -> None:
                     cls.setUpClass()
                 except Exception:
                     pass
-            class_setup_cache[cls] = (cls_lines, cls_fixtures)
+            if cls_lines:
+                cls_prefix = class_to_pytest_prefix(cls, repo_root)
+                class_setup_map[cls_prefix] = {
+                    k: compress_lines(v) for k, v in sorted(cls_lines.items())
+                }
 
         t_lines: dict[str, set[int]] = defaultdict(set)
         t_fixtures: set[str] = set()
@@ -236,21 +238,11 @@ def main() -> None:
         except Exception:
             pass
 
-        cls_lines, cls_fixtures = class_setup_cache[cls]
-        merged_lines: dict[str, list[list[int]]] = {}
-        all_files = set(t_lines.keys()) | set(cls_lines.keys())
-        for rel in sorted(all_files):
-            combined = t_lines.get(rel, set()) | cls_lines.get(rel, set())
-            if combined:
-                merged_lines[rel] = compress_lines(combined)
-
-        merged_fixtures = sorted(t_fixtures | cls_fixtures)
         test_coverage[pytest_id] = {
-            "lines": merged_lines,
-            "fixtures": merged_fixtures,
+            "lines": {k: compress_lines(v) for k, v in sorted(t_lines.items()) if v},
+            "fixtures": sorted(t_fixtures),
         }
 
-    current_test_name = "done"
     for cls in seen_classes:
         if hasattr(cls, "tearDownClass"):
             try:
@@ -263,15 +255,57 @@ def main() -> None:
     builtins.open = orig_builtins_open
     io.open = orig_io_open
 
-    payload = {
-        "import_lines": {k: compress_lines(v) for k, v in sorted(import_lines.items())},
+    return {
+        "import_lines": {k: list(v) for k, v in import_lines.items()},
         "file_import_lines": file_import_lines,
-        "import_fixtures": sorted(import_fixtures),
-        "ast_scopes": extract_ast_scopes(repo_root),
+        "class_setup_lines": class_setup_map,
+        "import_fixtures": list(import_fixtures),
         "tests": test_coverage,
     }
+
+
+def main() -> None:
+    t0 = time.time()
+    repo_root = Path(sys.argv[1]).resolve()
+    out_path = Path(sys.argv[2]).resolve()
+
+    all_test_files = sorted(
+        p.relative_to(repo_root).as_posix() for p in (repo_root / "tests").rglob("test_*.py")
+    )
+    all_test_files.sort(key=lambda r: -(repo_root / r).stat().st_size)
+
+    workers = min(4, os.cpu_count() or 2)
+    buckets: list[list[str]] = [[] for _ in range(workers)]
+    for i, rel_test in enumerate(all_test_files):
+        buckets[i % workers].append(rel_test)
+
+    print(f"Tracing {len(all_test_files)} test files across {workers} workers...", file=sys.stderr, flush=True)
+
+    merged_import_lines: dict[str, set[int]] = defaultdict(set)
+    merged_file_imports: dict[str, dict[str, list[list[int]]]] = {}
+    merged_class_setup: dict[str, dict[str, list[list[int]]]] = {}
+    merged_import_fixtures: set[str] = set()
+    merged_tests: dict[str, dict] = {}
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for res in pool.map(trace_test_files, [(str(repo_root), b) for b in buckets if b]):
+            for k, lns in res["import_lines"].items():
+                merged_import_lines[k].update(lns)
+            merged_file_imports.update(res["file_import_lines"])
+            merged_class_setup.update(res["class_setup_lines"])
+            merged_import_fixtures.update(res["import_fixtures"])
+            merged_tests.update(res["tests"])
+
+    payload = {
+        "import_lines": {k: compress_lines(v) for k, v in sorted(merged_import_lines.items())},
+        "file_import_lines": merged_file_imports,
+        "class_setup_lines": merged_class_setup,
+        "import_fixtures": sorted(merged_import_fixtures),
+        "ast_scopes": extract_ast_scopes(repo_root),
+        "tests": merged_tests,
+    }
     out_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-    print(f"Mapped {len(test_coverage)} tests in {time.time() - t0:.1f}s -> {out_path}", file=sys.stderr, flush=True)
+    print(f"Mapped {len(merged_tests)} tests in {time.time() - t0:.1f}s -> {out_path}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
