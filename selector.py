@@ -55,11 +55,11 @@ def duration_ms(seconds: float) -> int:
 
 
 def is_comment_only_py_diff(file_diffs: list[dict]) -> bool:
-    """Return True if every changed line across all .py hunks is whitespace or a # comment."""
+    """Return True if every changed line across all non-test .py hunks is whitespace or a # comment."""
     saw_change = False
     for fd in file_diffs:
         paths = [p for p in (fd["old_path"], fd["new_path"]) if p]
-        if not paths or any(not p.endswith(".py") for p in paths):
+        if not paths or any(not p.endswith(".py") or p.startswith("tests/") for p in paths):
             return False
         for h in fd["hunks"]:
             for hl in h["lines"]:
@@ -453,11 +453,19 @@ def main() -> None:
                                     (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 10))
                                 )
 
-                    # CRITICAL FIX: Class-level dicts/tuples/regexes execute at import time!
-                    # Include ALL tests (< 1500 ms) in every test file that imported the edited line,
-                    # NOT just the single fastest 1 ms test!
                     if hit_import_time:
                         selected.update(nums_by_method.get("test_lazy_load", []))
+                        for tf in rel_tfs:
+                            selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
+                        if rel_path.startswith("sqlglot/expressions/"):
+                            for tf in all_test_files:
+                                if tf.startswith("tests/dialects/test_") or tf in {
+                                    "tests/test_expressions.py",
+                                    "tests/test_parser.py",
+                                    "tests/test_generator.py",
+                                    "tests/test_transpile.py",
+                                }:
+                                    selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
                         for cp in candidate_paths:
                             for test_file, imp_map in file_import_lines.items():
                                 f_ranges = imp_map.get(cp, [])
@@ -495,19 +503,9 @@ def main() -> None:
                     for tf in rel_tfs:
                         selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
 
-                    if not matched_any_line and not selected:
-                        if is_dialect_module(rel_path):
-                            stem = Path(rel_path).stem.lower()
-                            for d in [stem, *DIALECT_INHERITANCE.get(stem, ())]:
-                                dial_tf = f"tests/dialects/test_{d}.py"
-                                if dial_tf in tests_by_file:
-                                    selected.update(
-                                        n for n in tests_by_file[dial_tf] if ms_by_num[n] < 3000 and n not in noisy_nums
-                                    )
+                    if not matched_any_line:
                         for tf in rel_tfs:
-                            selected.update(
-                                n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 3000 and n not in noisy_nums
-                            )
+                            selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
 
                 # 2. Config / Fixture / SQL / data files
                 else:
