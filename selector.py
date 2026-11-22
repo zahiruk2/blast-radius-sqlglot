@@ -32,7 +32,9 @@ DIALECT_OPTIMIZER_METHODS = {
     },
 }
 
-NOISY_BENCH_METHODS: set[str] = set()
+NOISY_BENCH_METHODS = {
+    "test_generator_memory",
+}
 
 
 def duration_ms(seconds: float) -> int:
@@ -159,13 +161,15 @@ def pack_workers(selected_nums: list[int], ms_by_num: dict[int, int]) -> list[li
 def is_dialect_module(rel_path: str) -> bool:
     return (
         rel_path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/"))
-        and rel_path != "sqlglot/dialects/dialect.py"
+        and not rel_path.endswith(("dialect.py", "__init__.py"))
     )
 
 
 def map_split_module_paths(rel_path: str) -> list[str]:
     paths = [rel_path]
     stem = Path(rel_path).stem
+    if stem == "__init__":
+        return paths
     if rel_path.startswith(("sqlglot/parsers/", "sqlglot/generators/")):
         paths.append(f"sqlglot/dialects/{stem}.py")
     elif rel_path.startswith("sqlglot/dialects/") and rel_path != "sqlglot/dialects/dialect.py":
@@ -182,7 +186,7 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
         if cand in all_test_files:
             matched.add(cand)
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
-    elif rel_path == "sqlglot/dialects/dialect.py":
+    elif rel_path in {"sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py"}:
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
     elif rel_path.startswith("sqlglot/optimizer/"):
         matched.update({
@@ -190,12 +194,13 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
             "tests/test_optimize_cross_joins.py",
             "tests/test_simplify_between.py",
         })
-        cand = f"tests/optimizer/test_{stem}.py"
-        if cand in all_test_files:
-            matched.add(cand)
+        if stem != "__init__":
+            cand = f"tests/optimizer/test_{stem}.py"
+            if cand in all_test_files:
+                matched.add(cand)
     elif rel_path.startswith("sqlglot/executor/"):
         matched.add("tests/test_executor.py")
-    else:
+    elif stem != "__init__":
         cand = f"tests/test_{stem}.py"
         if cand in all_test_files:
             matched.add(cand)
@@ -260,204 +265,215 @@ def main() -> None:
         need_serde_sweep = False
 
         for fd in file_diffs:
-            rel_path = fd["old_path"] or fd["new_path"]
-            if not rel_path:
+            paths_to_check = list(dict.fromkeys(p for p in (fd["old_path"], fd["new_path"]) if p))
+            if not paths_to_check:
                 continue
 
-            # 1. Python files
-            if rel_path.endswith(".py"):
-                repo_file = REPO_DIR / rel_path
-                orig_text = repo_file.read_text("utf-8") if repo_file.exists() else ""
-                src_lines_no_nl = orig_text.splitlines() if orig_text else []
+            for rel_path in paths_to_check:
+                # 1. Python files
+                if rel_path.endswith(".py"):
+                    repo_file = REPO_DIR / rel_path
+                    orig_text = repo_file.read_text("utf-8") if repo_file.exists() else ""
+                    src_lines_no_nl = orig_text.splitlines() if orig_text else []
 
-                # Direct test file edit
-                if rel_path.startswith("tests/"):
-                    file_nums = tests_by_file.get(rel_path, [])
-                    if file_nums:
-                        scopes = ast_scopes.get(rel_path, [])
-                        matched_methods: set[str] = set()
-                        hit_outside_func = False
-                        for h in fd["hunks"]:
-                            s, e = align_hunk_span(src_lines_no_nl, h)
-                            matched_hunk = False
-                            for sc in scopes:
-                                if sc["kind"] == "func" and not (sc["end"] < s or sc["start"] > e):
-                                    matched_methods.add(sc["name"])
-                                    matched_hunk = True
-                            if not matched_hunk:
-                                hit_outside_func = True
-                        if matched_methods and not hit_outside_func:
-                            for t in tests_data:
-                                if t["file"] == rel_path and any(
-                                    t["id"].endswith("::" + m) or t["id"].endswith("." + m)
-                                    for m in matched_methods
-                                ):
-                                    selected.add(t["number"])
-                        else:
-                            selected.update(file_nums)
-                    continue
+                    # Direct test file edit
+                    if rel_path.startswith("tests/"):
+                        file_nums = tests_by_file.get(rel_path, [])
+                        if file_nums:
+                            scopes = ast_scopes.get(rel_path, [])
+                            matched_methods: set[str] = set()
+                            hit_outside_func = False
+                            for h in fd["hunks"]:
+                                s, e = align_hunk_span(src_lines_no_nl, h)
+                                matched_hunk = False
+                                for sc in scopes:
+                                    if sc["kind"] == "func" and not (sc["end"] < s or sc["start"] > e):
+                                        matched_methods.add(sc["name"])
+                                        matched_hunk = True
+                                if not matched_hunk:
+                                    hit_outside_func = True
+                            if matched_methods and not hit_outside_func:
+                                for t in tests_data:
+                                    if t["file"] == rel_path and any(
+                                        t["id"].endswith("::" + m) or t["id"].endswith("." + m)
+                                        for m in matched_methods
+                                    ):
+                                        selected.add(t["number"])
+                            else:
+                                selected.update(file_nums)
+                        continue
 
-                if rel_path == "sqlglot/serde.py":
-                    need_serde_sweep = True
-                    continue
+                    if rel_path == "sqlglot/serde.py":
+                        need_serde_sweep = True
+                        continue
 
-                rel_tfs = related_test_files_for_src(rel_path, all_test_files)
+                    rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
-                # General optimizer & executor integration coverage (tpcds/tpch weren't line-traced)
-                if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
-                    stem = Path(rel_path).stem.lower()
-                    for m in ("test_optimize", "test_tpcds", "test_tpch", f"test_{stem}"):
-                        selected.update(nums_by_method.get(m, []))
-                    if rel_path.startswith("sqlglot/executor/") or stem in {
-                        "eliminate_joins",
-                        "optimize_joins",
-                        "pushdown_predicates",
-                        "pushdown_projections",
-                        "merge_subqueries",
-                        "simplify",
-                        "optimizer",
+                    # General optimizer & executor integration coverage (tpcds/tpch weren't line-traced)
+                    if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
+                        stem = Path(rel_path).stem.lower()
+                        for m in ("test_optimize", "test_tpcds", "test_tpch", "test_execute_tpch", f"test_{stem}"):
+                            selected.update(nums_by_method.get(m, []))
+                        if rel_path.startswith("sqlglot/executor/") or stem in {
+                            "eliminate_joins",
+                            "optimize_joins",
+                            "pushdown_predicates",
+                            "pushdown_projections",
+                            "merge_subqueries",
+                            "simplify",
+                            "optimizer",
+                            "annotate_types",
+                            "qualify_columns",
+                        }:
+                            for m in ("test_execute_tpcds", "test_execute_subqueries"):
+                                selected.update(nums_by_method.get(m, []))
+
+                    # General dialect optimizer/transpile coverage
+                    if is_dialect_module(rel_path) or rel_path in {
+                        "sqlglot/dialects/dialect.py",
+                        "sqlglot/dialects/__init__.py",
                     }:
-                        for m in ("test_execute_tpcds", "test_execute_tpch", "test_execute_subqueries"):
+                        stem = Path(rel_path).stem.lower()
+                        selected.update(nums_by_method.get("test_optimize", []))
+                        selected.update(nums_by_method.get("test_simplify", []))
+                        for m in DIALECT_OPTIMIZER_METHODS.get(stem, ()):
                             selected.update(nums_by_method.get(m, []))
 
-                # General dialect optimizer/transpile coverage
-                if is_dialect_module(rel_path) or rel_path == "sqlglot/dialects/dialect.py":
-                    stem = Path(rel_path).stem.lower()
-                    selected.update(nums_by_method.get("test_optimize", []))
-                    selected.update(nums_by_method.get("test_simplify", []))
-                    for m in DIALECT_OPTIMIZER_METHODS.get(stem, ()):
-                        selected.update(nums_by_method.get(m, []))
+                    candidate_paths = map_split_module_paths(rel_path)
+                    query_intervals: list[tuple[int, int]] = []
+                    scopes = ast_scopes.get(rel_path, [])
+                    imp_ranges = import_lines.get(rel_path, [])
+                    hit_import_time = False
 
-                candidate_paths = map_split_module_paths(rel_path)
-                query_intervals: list[tuple[int, int]] = []
-                scopes = ast_scopes.get(rel_path, [])
-                imp_ranges = import_lines.get(rel_path, [])
-                hit_import_time = False
+                    for h in fd["hunks"]:
+                        old_s, old_e = align_hunk_span(src_lines_no_nl, h)
+                        q_s = max(1, old_s - 3)
+                        q_e = old_e + 3
+                        query_intervals.append((q_s, q_e))
 
-                for h in fd["hunks"]:
-                    old_s, old_e = align_hunk_span(src_lines_no_nl, h)
-                    q_s = max(1, old_s - 3)
-                    q_e = old_e + 3
-                    query_intervals.append((q_s, q_e))
+                        if imp_ranges and range_intersects(imp_ranges, q_s, q_e):
+                            hit_import_time = True
 
-                    if imp_ranges and range_intersects(imp_ranges, q_s, q_e):
-                        hit_import_time = True
-
-                    enclosing_func = None
-                    for sc in scopes:
-                        if sc["kind"] == "func" and sc["start"] <= old_s and old_e <= sc["end"]:
-                            enclosing_func = sc
-                            break
-                    if enclosing_func is not None:
-                        query_intervals.append(
-                            (enclosing_func["start"], min(enclosing_func["end"], enclosing_func["start"] + 2))
-                        )
-                    else:
-                        enclosing_cls = None
+                        enclosing_func = None
                         for sc in scopes:
-                            if sc["kind"] == "class" and sc["start"] <= old_s and old_e <= sc["end"]:
-                                enclosing_cls = sc
+                            if sc["kind"] == "func" and sc["start"] <= old_s and old_e <= sc["end"]:
+                                enclosing_func = sc
                                 break
-                        if enclosing_cls is not None:
+                        if enclosing_func is not None:
                             query_intervals.append(
-                                (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 15))
+                                (enclosing_func["start"], min(enclosing_func["end"], enclosing_func["start"] + 2))
+                            )
+                        else:
+                            enclosing_cls = None
+                            for sc in scopes:
+                                if sc["kind"] == "class" and sc["start"] <= old_s and old_e <= sc["end"]:
+                                    enclosing_cls = sc
+                                    break
+                            if enclosing_cls is not None:
+                                query_intervals.append(
+                                    (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 15))
+                                )
+                                # Catch multi-line class dicts (FUNCTIONS, TRANSFORMS, TYPE_MAPPING, KEYWORDS)
+                                query_intervals.append(
+                                    (max(enclosing_cls["start"], old_s - 80), min(enclosing_cls["end"], old_e + 80))
+                                )
+
+                    if hit_import_time:
+                        for cp in candidate_paths:
+                            for test_file, imp_map in file_import_lines.items():
+                                f_ranges = imp_map.get(cp, [])
+                                if f_ranges and any(
+                                    range_intersects(f_ranges, qs, qe) for qs, qe in query_intervals
+                                ):
+                                    tf_nums = [n for n in tests_by_file.get(test_file, []) if n not in noisy_nums]
+                                    if tf_nums:
+                                        selected.add(min(tf_nums, key=lambda n: ms_by_num[n]))
+
+                    for cp in candidate_paths:
+                        for cls_prefix, cls_map in class_setup_lines.items():
+                            c_ranges = cls_map.get(cp, [])
+                            if c_ranges and any(
+                                range_intersects(c_ranges, qs, qe) for qs, qe in query_intervals
+                            ):
+                                c_nums = [n for n in tests_by_cls_prefix.get(cls_prefix, []) if n not in noisy_nums]
+                                if c_nums:
+                                    selected.add(min(c_nums, key=lambda n: ms_by_num[n]))
+
+                    matched_any_line = False
+                    for cp in candidate_paths:
+                        candidates = file_to_test_ranges.get(cp, [])
+                        for tnum, ranges in candidates:
+                            if tnum in noisy_nums:
+                                continue
+                            for qs, qe in query_intervals:
+                                if range_intersects(ranges, qs, qe):
+                                    selected.add(tnum)
+                                    matched_any_line = True
+                                    break
+
+                    for tf in rel_tfs:
+                        selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
+                    if rel_path in {
+                        "sqlglot/parser.py",
+                        "sqlglot/generator.py",
+                        "sqlglot/tokens.py",
+                        "sqlglot/tokenizer_core.py",
+                        "sqlglot/dialects/dialect.py",
+                        "sqlglot/dialects/__init__.py",
+                    } or rel_path.startswith("sqlglot/expressions/"):
+                        selected.update(unmapped_by_file.get("tests/test_parser.py", []))
+                        selected.update(unmapped_by_file.get("tests/test_optimizer.py", []))
+
+                    if not matched_any_line:
+                        if is_dialect_module(rel_path):
+                            stem = Path(rel_path).stem.lower()
+                            dial_tf = f"tests/dialects/test_{stem}.py"
+                            if dial_tf in tests_by_file:
+                                selected.update(n for n in tests_by_file[dial_tf] if n not in noisy_nums)
+                        for tf in rel_tfs:
+                            selected.update(
+                                n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 5000 and n not in noisy_nums
                             )
 
-                if hit_import_time:
-                    for cp in candidate_paths:
-                        for test_file, imp_map in file_import_lines.items():
-                            f_ranges = imp_map.get(cp, [])
-                            if f_ranges and any(
-                                range_intersects(f_ranges, qs, qe) for qs, qe in query_intervals
+                # 2. Fixture / SQL / data files
+                else:
+                    if rel_path in fixture_to_tests:
+                        selected.update(fixture_to_tests[rel_path])
+                    bname = Path(rel_path).name
+                    if bname in fixture_name_to_tests:
+                        selected.update(fixture_name_to_tests[bname])
+
+                    parts = Path(rel_path).parts
+                    stem = Path(rel_path).stem.lower()
+                    stem_base = stem.rstrip("s") if len(stem) > 4 else stem
+
+                    if "fixtures" in parts:
+                        idx = parts.index("fixtures")
+                        subparts = [p.lower() for p in parts[idx + 1 : -1]]
+                        for sub in subparts:
+                            for cand_tf in (
+                                f"tests/test_{sub}.py",
+                                f"tests/dialects/test_{sub}.py",
+                                f"tests/optimizer/test_{sub}.py",
                             ):
-                                tf_nums = [n for n in tests_by_file.get(test_file, []) if n not in noisy_nums]
-                                if tf_nums:
-                                    selected.add(min(tf_nums, key=lambda n: ms_by_num[n]))
+                                if cand_tf in tests_by_file:
+                                    method_matches = [
+                                        t["number"]
+                                        for t in tests_data
+                                        if t["file"] == cand_tf
+                                        and (
+                                            stem in t["id"].lower()
+                                            or (stem_base and stem_base in t["id"].lower())
+                                        )
+                                    ]
+                                    if method_matches:
+                                        selected.update(method_matches)
+                                    else:
+                                        selected.update(tests_by_file[cand_tf])
 
-                for cp in candidate_paths:
-                    for cls_prefix, cls_map in class_setup_lines.items():
-                        c_ranges = cls_map.get(cp, [])
-                        if c_ranges and any(
-                            range_intersects(c_ranges, qs, qe) for qs, qe in query_intervals
-                        ):
-                            c_nums = [n for n in tests_by_cls_prefix.get(cls_prefix, []) if n not in noisy_nums]
-                            if c_nums:
-                                selected.add(min(c_nums, key=lambda n: ms_by_num[n]))
-
-                matched_any_line = False
-                for cp in candidate_paths:
-                    candidates = file_to_test_ranges.get(cp, [])
-                    for tnum, ranges in candidates:
-                        if tnum in noisy_nums:
-                            continue
-                        for qs, qe in query_intervals:
-                            if range_intersects(ranges, qs, qe):
-                                selected.add(tnum)
-                                matched_any_line = True
-                                break
-
-                for tf in rel_tfs:
-                    selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
-                if rel_path in {
-                    "sqlglot/parser.py",
-                    "sqlglot/generator.py",
-                    "sqlglot/tokens.py",
-                    "sqlglot/tokenizer_core.py",
-                    "sqlglot/dialects/dialect.py",
-                } or rel_path.startswith("sqlglot/expressions/"):
-                    selected.update(unmapped_by_file.get("tests/test_parser.py", []))
-                    selected.update(unmapped_by_file.get("tests/test_optimizer.py", []))
-
-                if not matched_any_line:
-                    if is_dialect_module(rel_path):
-                        stem = Path(rel_path).stem.lower()
-                        dial_tf = f"tests/dialects/test_{stem}.py"
-                        if dial_tf in tests_by_file:
-                            selected.update(n for n in tests_by_file[dial_tf] if n not in noisy_nums)
-                    for tf in rel_tfs:
-                        selected.update(
-                            n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 5000 and n not in noisy_nums
-                        )
-
-            # 2. Fixture / SQL / data files
-            else:
-                if rel_path in fixture_to_tests:
-                    selected.update(fixture_to_tests[rel_path])
-                bname = Path(rel_path).name
-                if bname in fixture_name_to_tests:
-                    selected.update(fixture_name_to_tests[bname])
-
-                parts = Path(rel_path).parts
-                stem = Path(rel_path).stem.lower()
-                stem_base = stem.rstrip("s") if len(stem) > 4 else stem
-
-                if "fixtures" in parts:
-                    idx = parts.index("fixtures")
-                    subparts = [p.lower() for p in parts[idx + 1 : -1]]
-                    for sub in subparts:
-                        for cand_tf in (
-                            f"tests/test_{sub}.py",
-                            f"tests/dialects/test_{sub}.py",
-                            f"tests/optimizer/test_{sub}.py",
-                        ):
-                            if cand_tf in tests_by_file:
-                                method_matches = [
-                                    t["number"]
-                                    for t in tests_data
-                                    if t["file"] == cand_tf
-                                    and (
-                                        stem in t["id"].lower()
-                                        or (stem_base and stem_base in t["id"].lower())
-                                    )
-                                ]
-                                if method_matches:
-                                    selected.update(method_matches)
-                                else:
-                                    selected.update(tests_by_file[cand_tf])
-
-                for tfile, tnums in tests_by_file.items():
-                    if stem_base and stem_base in tfile.lower():
-                        selected.update(tnums)
+                    for tfile, tnums in tests_by_file.items():
+                        if stem_base and stem_base in tfile.lower():
+                            selected.update(tnums)
 
         if not selected and not need_serde_sweep:
             for tf in ("tests/test_transpile.py", "tests/test_parser.py"):
