@@ -32,9 +32,7 @@ DIALECT_OPTIMIZER_METHODS = {
     },
 }
 
-NOISY_BENCH_METHODS = {
-    "test_generator_memory",
-}
+NOISY_BENCH_METHODS: set[str] = set()
 
 
 def duration_ms(seconds: float) -> int:
@@ -184,6 +182,8 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
         if cand in all_test_files:
             matched.add(cand)
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
+    elif rel_path == "sqlglot/dialects/dialect.py":
+        matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
     elif rel_path.startswith("sqlglot/optimizer/"):
         matched.update({
             "tests/test_optimizer.py",
@@ -321,7 +321,7 @@ def main() -> None:
                             selected.update(nums_by_method.get(m, []))
 
                 # General dialect optimizer/transpile coverage
-                if is_dialect_module(rel_path):
+                if is_dialect_module(rel_path) or rel_path == "sqlglot/dialects/dialect.py":
                     stem = Path(rel_path).stem.lower()
                     selected.update(nums_by_method.get("test_optimize", []))
                     selected.update(nums_by_method.get("test_simplify", []))
@@ -330,7 +330,6 @@ def main() -> None:
 
                 candidate_paths = map_split_module_paths(rel_path)
                 query_intervals: list[tuple[int, int]] = []
-                top_level_change = False
                 scopes = ast_scopes.get(rel_path, [])
                 imp_ranges = import_lines.get(rel_path, [])
                 hit_import_time = False
@@ -363,7 +362,6 @@ def main() -> None:
                             query_intervals.append(
                                 (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 15))
                             )
-                        top_level_change = True
 
                 if hit_import_time:
                     for cp in candidate_paths:
@@ -397,13 +395,6 @@ def main() -> None:
                                 selected.add(tnum)
                                 matched_any_line = True
                                 break
-                    if top_level_change and candidates:
-                        for tnum, ranges in candidates:
-                            if tnum in noisy_nums:
-                                continue
-                            if range_intersects(ranges, 1, 150):
-                                selected.add(tnum)
-                                matched_any_line = True
 
                 for tf in rel_tfs:
                     selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
@@ -412,6 +403,7 @@ def main() -> None:
                     "sqlglot/generator.py",
                     "sqlglot/tokens.py",
                     "sqlglot/tokenizer_core.py",
+                    "sqlglot/dialects/dialect.py",
                 } or rel_path.startswith("sqlglot/expressions/"):
                     selected.update(unmapped_by_file.get("tests/test_parser.py", []))
                     selected.update(unmapped_by_file.get("tests/test_optimizer.py", []))
@@ -466,6 +458,11 @@ def main() -> None:
                 for tfile, tnums in tests_by_file.items():
                     if stem_base and stem_base in tfile.lower():
                         selected.update(tnums)
+
+        if not selected and not need_serde_sweep:
+            for tf in ("tests/test_transpile.py", "tests/test_parser.py"):
+                selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 3000)
+            selected.update(nums_by_method.get("test_optimize", []))
 
         if need_serde_sweep:
             serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", []) if tnum not in noisy_nums}
