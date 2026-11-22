@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Runtime test selector & optimal worker scheduler for blast-radius."""
 
 from __future__ import annotations
@@ -32,46 +32,42 @@ DIALECT_OPTIMIZER_METHODS = {
     },
 }
 
+# Verified full Dialect / Tokenizer / Parser / Generator subclass graph
 DIALECT_INHERITANCE = {
-    "hive": ["spark2", "spark", "databricks"],
-    "spark2": ["spark", "databricks"],
+    "hive": ["spark2", "spark", "databricks", "athena"],
+    "spark2": ["spark", "databricks", "athena"],
     "spark": ["databricks"],
-    "presto": ["trino", "athena"],
-    "trino": ["athena"],
+    "presto": ["trino", "athena", "dune"],
+    "trino": ["athena", "dune"],
     "postgres": ["redshift", "duckdb", "materialize", "risingwave", "cockroach", "greenplum", "timescale"],
     "mysql": ["doris", "starrocks", "singlestore", "tidb", "mariadb"],
     "duckdb": ["motherduck"],
     "tsql": ["fabric"],
     "oracle": ["snowflake"],
+    "jsonpath": ["bigquery", "databricks", "hive", "snowflake"],
 }
 
-NOISY_BENCH_METHODS = {
-    "test_generator_memory",
+CORE_SHARED_FILES = {
+    "sqlglot/__init__.py",
+    "sqlglot/dialects/__init__.py",
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/parser.py",
+    "sqlglot/generator.py",
+    "sqlglot/tokens.py",
+    "sqlglot/tokenizer_core.py",
+    "sqlglot/helper.py",
+    "sqlglot/time.py",
+    "sqlglot/errors.py",
+    "sqlglot/trie.py",
+    "sqlglot/jsonpath.py",
+    "sqlglot/transforms.py",
+    "sqlglot/diff.py",
+    "sqlglot/lineage.py",
 }
 
 
 def duration_ms(seconds: float) -> int:
     return math.floor(seconds * 1000 + 0.5)
-
-
-def is_comment_only_py_diff(file_diffs: list[dict]) -> bool:
-    """Return True if every changed line across all non-test .py hunks is whitespace or a # comment."""
-    saw_change = False
-    for fd in file_diffs:
-        paths = [p for p in (fd["old_path"], fd["new_path"]) if p]
-        if not paths or any(not p.endswith(".py") or p.startswith("tests/") for p in paths):
-            return False
-        for h in fd["hunks"]:
-            for hl in h["lines"]:
-                if not hl or hl[0] not in ("+", "-"):
-                    continue
-                content = hl[1:].strip()
-                if not content:
-                    continue
-                saw_change = True
-                if not content.startswith("#"):
-                    return False
-    return saw_change
 
 
 def parse_unified_diff(patch_text: str) -> list[dict]:
@@ -214,12 +210,14 @@ def map_split_module_paths(rel_path: str) -> list[str]:
 def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[str]:
     matched: set[str] = set()
     stem = Path(rel_path).stem.lower()
-    if is_dialect_module(rel_path):
+    if is_dialect_module(rel_path) or rel_path == "sqlglot/jsonpath.py":
         for d in [stem, *DIALECT_INHERITANCE.get(stem, ())]:
             cand = f"tests/dialects/test_{d}.py"
             if cand in all_test_files:
                 matched.add(cand)
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
+        if rel_path == "sqlglot/jsonpath.py":
+            matched.add("tests/test_jsonpath.py")
     elif rel_path in {"sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py"}:
         matched.update({"tests/test_dialect.py", "tests/test_transpile.py"})
     elif rel_path.startswith("sqlglot/optimizer/"):
@@ -238,6 +236,11 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
         matched.add("tests/test_dataframe.py")
     elif rel_path.startswith("sqlglot/typing/"):
         matched.add("tests/test_typing.py")
+        if stem != "__init__":
+            for d in [stem, *DIALECT_INHERITANCE.get(stem, ())]:
+                cand = f"tests/dialects/test_{d}.py"
+                if cand in all_test_files:
+                    matched.add(cand)
     elif rel_path in {"sqlglot/build.py", "sqlglot/sqlglotc.py", "setup.py", "pyproject.toml"}:
         matched.update({"tests/test_build.py", "tests/test_sqlglotc.py"})
     elif stem != "__init__":
@@ -268,7 +271,8 @@ def main() -> None:
             tests_by_cls_prefix[cls_prefix].append(num)
 
     all_test_files = set(tests_by_file.keys())
-    noisy_nums = {n for m in NOISY_BENCH_METHODS for n in nums_by_method.get(m, [])}
+    all_dialect_test_files = sorted(tf for tf in all_test_files if tf.startswith("tests/dialects/test_"))
+    fast_all_nums = [t["number"] for t in tests_data if ms_by_num[t["number"]] < 1000]
 
     file_to_test_ranges: dict[str, list[tuple[int, list[list[int]]]]] = defaultdict(list)
     fixture_to_tests: dict[str, set[int]] = defaultdict(set)
@@ -318,6 +322,11 @@ def main() -> None:
 
                     # Direct test file or test helper edit
                     if rel_path.startswith("tests/"):
+                        if rel_path == "tests/dialects/test_dialect.py":
+                            # Defines Validator base class used by all dialect test files
+                            for tf in all_dialect_test_files:
+                                selected.update(tests_by_file.get(tf, []))
+                            continue
                         file_nums = tests_by_file.get(rel_path, [])
                         if file_nums:
                             scopes = ast_scopes.get(rel_path, [])
@@ -348,8 +357,8 @@ def main() -> None:
                             else:
                                 selected.update(file_nums)
                         else:
-                            for tf in ("tests/test_dialect.py", "tests/test_transpile.py", "tests/test_parser.py"):
-                                selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] <= 1000)
+                            # tests/helpers.py or conftest/init
+                            selected.update(fast_all_nums)
                             selected.update(nums_by_method.get("test_optimize", []))
                         continue
 
@@ -364,22 +373,56 @@ def main() -> None:
 
                     rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
-                    if rel_path in {"sqlglot/__init__.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"}:
-                        selected.update(nums_by_method.get("test_lazy_load", []))
-
+                    # Heavy test gates (only run >=1.0s tests when their owning subsystem changes)
                     if rel_path in {"sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py"}:
                         selected.update(nums_by_method.get("test_max_nodes", []))
+
+                    if rel_path == "sqlglot/generator.py":
+                        selected.update(nums_by_method.get("test_generator_memory", []))
 
                     if rel_path == "sqlglot/schema.py":
                         selected.update(nums_by_method.get("test_cache_does_not_retain_queries", []))
 
+                    if rel_path in {"sqlglot/__init__.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"}:
+                        selected.update(nums_by_method.get("test_lazy_load", []))
+
+                    # Core/shared modules: include all fast dialect & core suites (<=14s total)
+                    if rel_path in CORE_SHARED_FILES:
+                        for tf in all_dialect_test_files:
+                            selected.update(tests_by_file.get(tf, []))
+                        for tf in (
+                            "tests/test_expressions.py",
+                            "tests/test_transpile.py",
+                            "tests/test_tokens.py",
+                            "tests/test_time.py",
+                            "tests/test_helper.py",
+                            "tests/test_errors.py",
+                            "tests/test_transforms.py",
+                            "tests/test_jsonpath.py",
+                            "tests/test_diff.py",
+                            "tests/test_lineage.py",
+                            "tests/test_parser.py",
+                            "tests/test_generator.py",
+                        ):
+                            selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 1000)
+
+                    # Expressions & typing metadata
                     if rel_path.startswith(("sqlglot/expressions/", "sqlglot/typing/")):
                         selected.update(nums_by_method.get("test_no_redundant_expression_metadata", []))
-                        selected.update(tests_by_file.get("tests/test_serde.py", []))
                         selected.update(nums_by_method.get("test_identity", []))
+                        selected.update(nums_by_method.get("test_annotate_types", []))
+                        if rel_path.startswith("sqlglot/expressions/"):
+                            selected.update(tests_by_file.get("tests/test_serde.py", []))
+                            for tf in (
+                                "tests/test_expressions.py",
+                                "tests/test_parser.py",
+                                "tests/test_generator.py",
+                                "tests/test_transpile.py",
+                            ):
+                                selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 1000)
 
                     # Optimizer & executor integration coverage
-                    if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
+                    if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/", "sqlglot/planner.py")):
                         stem = Path(rel_path).stem.lower()
                         for m in (
                             "test_optimize",
@@ -391,27 +434,33 @@ def main() -> None:
                             f"test_{stem}",
                         ):
                             selected.update(nums_by_method.get(m, []))
-                        if rel_path.startswith("sqlglot/executor/") or stem in {
+                        if rel_path.startswith(("sqlglot/executor/", "sqlglot/planner.py")) or stem in {
                             "eliminate_joins",
                             "optimize_joins",
                             "pushdown_predicates",
                             "pushdown_projections",
                             "merge_subqueries",
                             "unnest_subqueries",
+                            "scope",
                         }:
                             for m in ("test_execute_tpcds", "test_tpcds"):
                                 selected.update(nums_by_method.get(m, []))
+                        # Include unmapped optimizer & databricks optimize tests
+                        selected.update(unmapped_by_file.get("tests/test_optimizer.py", []))
+                        selected.update(unmapped_by_file.get("tests/dialects/test_databricks.py", []))
 
-                    # General dialect optimizer/transpile coverage
-                    if is_dialect_module(rel_path) or rel_path in {
-                        "sqlglot/dialects/dialect.py",
-                        "sqlglot/dialects/__init__.py",
-                    }:
+                    # Dialect modules: always run entire dialect + child dialect test files (0.01s-1.39s)
+                    if is_dialect_module(rel_path):
+                        for tf in rel_tfs:
+                            selected.update(tests_by_file.get(tf, []))
                         stem = Path(rel_path).stem.lower()
                         selected.update(nums_by_method.get("test_optimize", []))
                         selected.update(nums_by_method.get("test_simplify", []))
                         for m in DIALECT_OPTIMIZER_METHODS.get(stem, ()):
                             selected.update(nums_by_method.get(m, []))
+                    elif rel_path in {"sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py"}:
+                        selected.update(nums_by_method.get("test_optimize", []))
+                        selected.update(nums_by_method.get("test_simplify", []))
 
                     candidate_paths = map_split_module_paths(rel_path)
                     query_intervals: list[tuple[int, int]] = []
@@ -421,8 +470,8 @@ def main() -> None:
 
                     for h in fd["hunks"]:
                         old_s, old_e = align_hunk_span(src_lines_no_nl, h)
-                        q_s = max(1, old_s - 1)
-                        q_e = old_e + 1
+                        q_s = max(1, old_s - 2)
+                        q_e = old_e + 2
                         query_intervals.append((q_s, q_e))
 
                         if imp_ranges and range_intersects(imp_ranges, q_s, q_e):
@@ -434,9 +483,8 @@ def main() -> None:
                                 enclosing_func = sc
                                 break
                         if enclosing_func is not None:
-                            query_intervals.append(
-                                (enclosing_func["start"], min(enclosing_func["end"], enclosing_func["start"] + 1))
-                            )
+                            # Query the whole enclosing function so insertions/branch edits never miss
+                            query_intervals.append((enclosing_func["start"], enclosing_func["end"]))
                         else:
                             enclosing_cls = None
                             for sc in scopes:
@@ -445,33 +493,31 @@ def main() -> None:
                                     break
                             if enclosing_cls is not None:
                                 hit_import_time = True
-                                query_intervals.append(
-                                    (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 10))
-                                )
+                                query_intervals.append((enclosing_cls["start"], enclosing_cls["end"]))
 
                     if hit_import_time:
                         selected.update(nums_by_method.get("test_lazy_load", []))
                         for tf in rel_tfs:
-                            selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
+                            selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 1000)
                         if rel_path.startswith("sqlglot/expressions/"):
-                            for tf in (
-                                "tests/test_expressions.py",
-                                "tests/test_parser.py",
-                                "tests/test_generator.py",
-                                "tests/test_transpile.py",
-                            ):
-                                selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
                             edited_classes = {
                                 sc["name"]
                                 for h in fd["hunks"]
                                 for sc in scopes
                                 if sc["kind"] == "class"
-                                and not (sc["end"] < align_hunk_span(src_lines_no_nl, h)[0] or sc["start"] > align_hunk_span(src_lines_no_nl, h)[1])
+                                and not (
+                                    sc["end"] < align_hunk_span(src_lines_no_nl, h)[0]
+                                    or sc["start"] > align_hunk_span(src_lines_no_nl, h)[1]
+                                )
                             }
                             if edited_classes:
                                 expr_dir = REPO_DIR / "sqlglot" / "expressions"
                                 if expr_dir.exists():
-                                    sub_pat = re.compile(r"class\s+(\w+)\s*\([^)]*\b(?:" + "|".join(re.escape(c) for c in edited_classes) + r")\b")
+                                    sub_pat = re.compile(
+                                        r"class\s+(\w+)\s*\([^)]*\b(?:"
+                                        + "|".join(re.escape(c) for c in edited_classes)
+                                        + r")\b"
+                                    )
                                     for ep in expr_dir.glob("*.py"):
                                         edited_classes.update(sub_pat.findall(ep.read_text("utf-8", errors="ignore")))
                                 cls_pat = re.compile(r"\b(?:" + "|".join(re.escape(c) for c in edited_classes) + r")\b")
@@ -480,17 +526,18 @@ def main() -> None:
                                     sub_dir = REPO_DIR / "sqlglot" / sub
                                     if sub_dir.exists():
                                         for df_py in sub_dir.glob("*.py"):
-                                            if df_py.stem not in {"__init__", "dialect"} and cls_pat.search(df_py.read_text("utf-8", errors="ignore")):
+                                            if df_py.stem not in {"__init__", "dialect"} and cls_pat.search(
+                                                df_py.read_text("utf-8", errors="ignore")
+                                            ):
                                                 matched_dialects.add(df_py.stem.lower())
                                                 matched_dialects.update(DIALECT_INHERITANCE.get(df_py.stem.lower(), ()))
                                 for d in matched_dialects:
                                     cand = f"tests/dialects/test_{d}.py"
                                     if cand in tests_by_file:
-                                        selected.update(n for n in tests_by_file[cand] if n not in noisy_nums)
+                                        selected.update(tests_by_file[cand])
                             else:
-                                for tf in all_test_files:
-                                    if tf.startswith("tests/dialects/test_"):
-                                        selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
+                                for tf in all_dialect_test_files:
+                                    selected.update(tests_by_file.get(tf, []))
                         for cp in candidate_paths:
                             for test_file, imp_map in file_import_lines.items():
                                 f_ranges = imp_map.get(cp, [])
@@ -500,7 +547,7 @@ def main() -> None:
                                     selected.update(
                                         n
                                         for n in tests_by_file.get(test_file, [])
-                                        if n not in noisy_nums
+                                        if ms_by_num[n] < 1000
                                     )
 
                     for cp in candidate_paths:
@@ -509,7 +556,7 @@ def main() -> None:
                             if c_ranges and any(
                                 range_intersects(c_ranges, qs, qe) for qs, qe in query_intervals
                             ):
-                                c_nums = [n for n in tests_by_cls_prefix.get(cls_prefix, []) if n not in noisy_nums]
+                                c_nums = tests_by_cls_prefix.get(cls_prefix, [])
                                 if c_nums:
                                     selected.add(min(c_nums, key=lambda n: ms_by_num[n]))
 
@@ -517,20 +564,20 @@ def main() -> None:
                     for cp in candidate_paths:
                         candidates = file_to_test_ranges.get(cp, [])
                         for tnum, ranges in candidates:
-                            if tnum in noisy_nums:
-                                continue
                             for qs, qe in query_intervals:
                                 if range_intersects(ranges, qs, qe):
                                     selected.add(tnum)
                                     matched_any_line = True
                                     break
 
+                    # Always include fast tests and unmapped tests from directly related test files
                     for tf in rel_tfs:
-                        selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
+                        selected.update(unmapped_by_file.get(tf, []))
+                        selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 1000)
 
                     if not matched_any_line:
                         for tf in rel_tfs:
-                            selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
+                            selected.update(tests_by_file.get(tf, []))
 
                 # 2. Config / Fixture / SQL / data files
                 else:
@@ -578,12 +625,11 @@ def main() -> None:
                             selected.update(tnums)
 
         if not selected and not need_serde_sweep:
-            for tf in ("tests/test_transpile.py", "tests/test_parser.py"):
-                selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 3000)
+            selected.update(fast_all_nums)
             selected.update(nums_by_method.get("test_optimize", []))
 
         if need_serde_sweep:
-            serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", []) if tnum not in noisy_nums}
+            serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", [])}
             serde_set.update(tests_by_file.get("tests/test_serde.py", []))
             serde_set.update(nums_by_method.get("test_optimize", []))
             serde_set.update(nums_by_method.get("test_execute_tpcds", []))
