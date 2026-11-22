@@ -128,7 +128,7 @@ def align_hunk_span(src_lines: list[str], hunk: dict) -> tuple[int, int]:
         for delta in range(0, max_delta + 1):
             for cand in (approx_idx - delta, approx_idx + delta):
                 if 0 <= cand < len(src_lines) and src_lines[cand] == needle:
-                    return max(1, cand + 1 - 3), min(len(src_lines), cand + 1 + n + 3)
+                    return max(1, cand + 1 - 2), min(len(src_lines), cand + 1 + n + 2)
 
     return old_s, old_e
 
@@ -214,6 +214,10 @@ def related_test_files_for_src(rel_path: str, all_test_files: set[str]) -> set[s
                 matched.add(cand)
     elif rel_path.startswith("sqlglot/executor/"):
         matched.add("tests/test_executor.py")
+    elif rel_path.startswith("sqlglot/dataframe/"):
+        matched.add("tests/test_dataframe.py")
+    elif rel_path.startswith("sqlglot/typing/"):
+        matched.add("tests/test_typing.py")
     elif stem != "__init__":
         cand = f"tests/test_{stem}.py"
         if cand in all_test_files:
@@ -322,7 +326,6 @@ def main() -> None:
                             else:
                                 selected.update(file_nums)
                         else:
-                            # Shared test helper under tests/ (e.g., tests/helpers.py)
                             for tf in ("tests/test_dialect.py", "tests/test_transpile.py", "tests/test_parser.py"):
                                 selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] <= 1000)
                             selected.update(nums_by_method.get("test_optimize", []))
@@ -337,36 +340,16 @@ def main() -> None:
                     if rel_path in {"sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py"}:
                         selected.update(nums_by_method.get("test_max_nodes", []))
 
-                    if rel_path == "sqlglot/schema.py" or rel_path.startswith("sqlglot/optimizer/"):
+                    if rel_path == "sqlglot/schema.py":
                         selected.update(nums_by_method.get("test_cache_does_not_retain_queries", []))
 
-                    # General optimizer & executor integration coverage (tpcds/tpch weren't line-traced)
+                    # Targeted optimizer & executor integration coverage
                     if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
                         stem = Path(rel_path).stem.lower()
-                        for m in (
-                            "test_optimize",
-                            "test_tpcds",
-                            "test_tpch",
-                            "test_execute_tpch",
-                            "test_optimized_tpch",
-                            "test_agg_order",
-                            f"test_{stem}",
-                        ):
+                        for m in ("test_optimize", f"test_{stem}"):
                             selected.update(nums_by_method.get(m, []))
-                        if rel_path.startswith("sqlglot/executor/") or stem in {
-                            "eliminate_joins",
-                            "optimize_joins",
-                            "pushdown_predicates",
-                            "pushdown_projections",
-                            "merge_subqueries",
-                            "simplify",
-                            "optimizer",
-                            "annotate_types",
-                            "qualify_columns",
-                            "qualify_tables",
-                            "scope",
-                        }:
-                            for m in ("test_execute_tpcds", "test_execute_subqueries"):
+                        if rel_path.startswith("sqlglot/executor/"):
+                            for m in ("test_tpcds", "test_tpch", "test_execute_tpch", "test_optimized_tpch", "test_agg_order"):
                                 selected.update(nums_by_method.get(m, []))
 
                     # General dialect optimizer/transpile coverage
@@ -388,8 +371,8 @@ def main() -> None:
 
                     for h in fd["hunks"]:
                         old_s, old_e = align_hunk_span(src_lines_no_nl, h)
-                        q_s = max(1, old_s - 3)
-                        q_e = old_e + 3
+                        q_s = max(1, old_s - 1)
+                        q_e = old_e + 1
                         query_intervals.append((q_s, q_e))
 
                         if imp_ranges and range_intersects(imp_ranges, q_s, q_e):
@@ -402,7 +385,7 @@ def main() -> None:
                                 break
                         if enclosing_func is not None:
                             query_intervals.append(
-                                (enclosing_func["start"], min(enclosing_func["end"], enclosing_func["start"] + 2))
+                                (enclosing_func["start"], min(enclosing_func["end"], enclosing_func["start"] + 1))
                             )
                         else:
                             enclosing_cls = None
@@ -412,10 +395,10 @@ def main() -> None:
                                     break
                             if enclosing_cls is not None:
                                 query_intervals.append(
-                                    (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 15))
+                                    (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 10))
                                 )
                                 query_intervals.append(
-                                    (max(enclosing_cls["start"], old_s - 80), min(enclosing_cls["end"], old_e + 80))
+                                    (max(enclosing_cls["start"], old_s - 25), min(enclosing_cls["end"], old_e + 25))
                                 )
 
                     if hit_import_time:
@@ -453,16 +436,6 @@ def main() -> None:
 
                     for tf in rel_tfs:
                         selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
-                    if rel_path in {
-                        "sqlglot/parser.py",
-                        "sqlglot/generator.py",
-                        "sqlglot/tokens.py",
-                        "sqlglot/tokenizer_core.py",
-                        "sqlglot/dialects/dialect.py",
-                        "sqlglot/dialects/__init__.py",
-                    } or rel_path.startswith("sqlglot/expressions/"):
-                        selected.update(unmapped_by_file.get("tests/test_parser.py", []))
-                        selected.update(unmapped_by_file.get("tests/test_optimizer.py", []))
 
                     if not matched_any_line:
                         if is_dialect_module(rel_path):

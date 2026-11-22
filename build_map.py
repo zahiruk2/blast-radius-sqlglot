@@ -16,7 +16,7 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-SKIP_SLOW_METHODS = {"test_execute_tpcds", "test_execute_tpch"}
+SKIP_SLOW_METHODS: set[str] = set()
 
 
 def collect_unittest_cases(suite: unittest.TestSuite) -> list[unittest.TestCase]:
@@ -98,7 +98,7 @@ def class_to_pytest_prefix(cls: type, repo_root: Path) -> str:
 
 def trace_test_files(args: tuple[str, list[str]]) -> dict:
     repo_str, test_rel_paths = args
-    os.environ["SKIP_INTEGRATION"] = "1"
+    os.environ.pop("SKIP_INTEGRATION", None)
     repo_root = Path(repo_str).resolve()
     sys.path.insert(0, str(repo_root))
     os.chdir(repo_root)
@@ -111,6 +111,7 @@ def trace_test_files(args: tuple[str, list[str]]) -> dict:
 
     orig_builtins_open = builtins.open
     orig_io_open = io.open
+    orig_path_open = Path.open
 
     def record_path(file_arg) -> None:
         try:
@@ -131,8 +132,13 @@ def trace_test_files(args: tuple[str, list[str]]) -> dict:
         record_path(file)
         return orig_io_open(file, *args, **kwargs)
 
+    def hooked_path_open(self, *args, **kwargs):
+        record_path(self)
+        return orig_path_open(self, *args, **kwargs)
+
     builtins.open = hooked_builtins_open
     io.open = hooked_io_open
+    Path.open = hooked_path_open
 
     TOOL_ID = sys.monitoring.COVERAGE_ID
     sys.monitoring.use_tool_id(TOOL_ID, "blast_mapper")
@@ -254,6 +260,7 @@ def trace_test_files(args: tuple[str, list[str]]) -> dict:
     sys.monitoring.free_tool_id(TOOL_ID)
     builtins.open = orig_builtins_open
     io.open = orig_io_open
+    Path.open = orig_path_open
 
     return {
         "import_lines": {k: list(v) for k, v in import_lines.items()},
