@@ -45,7 +45,9 @@ DIALECT_INHERITANCE = {
     "oracle": ["snowflake"],
 }
 
-NOISY_BENCH_METHODS: set[str] = set()
+NOISY_BENCH_METHODS = {
+    "test_generator_memory",
+}
 
 
 def duration_ms(seconds: float) -> int:
@@ -241,8 +243,6 @@ def main() -> None:
 
     all_test_files = set(tests_by_file.keys())
     noisy_nums = {n for m in NOISY_BENCH_METHODS for n in nums_by_method.get(m, [])}
-    # 1,606 fast tests <= 1000ms (99.1% of the entire suite, ~24.5s total across 8 workers = ~3.1s/worker)
-    all_fast_nums = {n for n, ms in ms_by_num.items() if ms <= 50 and n not in noisy_nums}
 
     file_to_test_ranges: dict[str, list[tuple[int, list[list[int]]]]] = defaultdict(list)
     fixture_to_tests: dict[str, set[int]] = defaultdict(set)
@@ -277,7 +277,6 @@ def main() -> None:
 
         selected: set[int] = set()
         need_serde_sweep = False
-        touched_non_test = False
 
         for fd in file_diffs:
             paths_to_check = list(dict.fromkeys(p for p in (fd["old_path"], fd["new_path"]) if p))
@@ -291,34 +290,43 @@ def main() -> None:
                     orig_text = repo_file.read_text("utf-8") if repo_file.exists() else ""
                     src_lines_no_nl = orig_text.splitlines() if orig_text else []
 
-                    # Direct test file edit
+                    # Direct test file or test helper edit
                     if rel_path.startswith("tests/"):
                         file_nums = tests_by_file.get(rel_path, [])
                         if file_nums:
                             scopes = ast_scopes.get(rel_path, [])
                             matched_methods: set[str] = set()
-                            hit_outside_func = False
+                            hit_non_test_scope = False
                             for h in fd["hunks"]:
                                 s, e = align_hunk_span(src_lines_no_nl, h)
                                 matched_hunk = False
                                 for sc in scopes:
                                     if sc["kind"] == "func" and not (sc["end"] < s or sc["start"] > e):
-                                        matched_methods.add(sc["name"])
-                                        matched_hunk = True
+                                        if sc["name"].startswith("test_"):
+                                            matched_methods.add(sc["name"])
+                                            matched_hunk = True
+                                        else:
+                                            hit_non_test_scope = True
                                 if not matched_hunk:
-                                    hit_outside_func = True
-                            if matched_methods and not hit_outside_func:
+                                    hit_non_test_scope = True
+                            if matched_methods and not hit_non_test_scope:
+                                before_len = len(selected)
                                 for t in tests_data:
                                     if t["file"] == rel_path and any(
                                         t["id"].endswith("::" + m) or t["id"].endswith("." + m)
                                         for m in matched_methods
                                     ):
                                         selected.add(t["number"])
+                                if len(selected) == before_len:
+                                    selected.update(file_nums)
                             else:
                                 selected.update(file_nums)
+                        else:
+                            # Shared test helper under tests/ (e.g., tests/helpers.py)
+                            for tf in ("tests/test_dialect.py", "tests/test_transpile.py", "tests/test_parser.py"):
+                                selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] <= 1000)
+                            selected.update(nums_by_method.get("test_optimize", []))
                         continue
-
-                    touched_non_test = True
 
                     if rel_path == "sqlglot/serde.py":
                         need_serde_sweep = True
@@ -326,12 +334,8 @@ def main() -> None:
 
                     rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
-                    # Explicit coverage for the 14 slow tests (> 1.0s)
                     if rel_path in {"sqlglot/parser.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py"}:
                         selected.update(nums_by_method.get("test_max_nodes", []))
-
-                    if rel_path == "sqlglot/generator.py":
-                        selected.update(nums_by_method.get("test_generator_memory", []))
 
                     if rel_path == "sqlglot/schema.py" or rel_path.startswith("sqlglot/optimizer/"):
                         selected.update(nums_by_method.get("test_cache_does_not_retain_queries", []))
@@ -346,12 +350,6 @@ def main() -> None:
                             "test_execute_tpch",
                             "test_optimized_tpch",
                             "test_agg_order",
-                            "test_scope",
-                            "test_annotate_funcs",
-                            "test_qualify_columns",
-                            "test_optimize_in_nulls",
-                            "test_merge_subqueries",
-                            "test_canonicalize",
                             f"test_{stem}",
                         ):
                             selected.update(nums_by_method.get(m, []))
@@ -480,7 +478,6 @@ def main() -> None:
 
                 # 2. Fixture / SQL / data files
                 else:
-                    touched_non_test = True
                     if rel_path in fixture_to_tests:
                         selected.update(fixture_to_tests[rel_path])
                     bname = Path(rel_path).name
@@ -519,15 +516,13 @@ def main() -> None:
                         if stem_base and stem_base in tfile.lower():
                             selected.update(tnums)
 
-        if touched_non_test:
-            selected.update(all_fast_nums)
-
         if not selected and not need_serde_sweep:
-            selected.update(all_fast_nums)
+            for tf in ("tests/test_transpile.py", "tests/test_parser.py"):
+                selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 3000)
+            selected.update(nums_by_method.get("test_optimize", []))
 
         if need_serde_sweep:
-            serde_set = set(all_fast_nums)
-            serde_set.update(tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", []) if tnum not in noisy_nums)
+            serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", []) if tnum not in noisy_nums}
             serde_set.update(tests_by_file.get("tests/test_serde.py", []))
             serde_set.update(nums_by_method.get("test_optimize", []))
             serde_set.update(nums_by_method.get("test_execute_tpcds", []))
