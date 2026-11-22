@@ -219,6 +219,7 @@ def main() -> None:
             tests_by_cls_prefix[cls_prefix].append(num)
 
     all_test_files = set(tests_by_file.keys())
+    noisy_nums = {n for m in NOISY_BENCH_METHODS for n in nums_by_method.get(m, [])}
 
     file_to_test_ranges: dict[str, list[tuple[int, list[list[int]]]]] = defaultdict(list)
     fixture_to_tests: dict[str, set[int]] = defaultdict(set)
@@ -298,20 +299,27 @@ def main() -> None:
 
                 rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
-                if rel_path == "sqlglot/optimizer/eliminate_joins.py":
-                    for m in (
-                        "test_eliminate_joins",
-                        "test_optimize",
-                        "test_tpcds",
-                        "test_tpch",
-                        "test_execute_tpcds",
-                        "test_execute_tpch",
-                        "test_execute_subqueries",
-                    ):
+            # General optimizer & executor integration coverage (tpcds/tpch weren't line-traced)
+                if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
+                    stem = Path(rel_path).stem.lower()
+                    for m in ("test_optimize", "test_tpcds", "test_tpch", f"test_{stem}"):
                         selected.update(nums_by_method.get(m, []))
-
+                    if rel_path.startswith("sqlglot/executor/") or stem in {
+                        "eliminate_joins",
+                        "optimize_joins",
+                        "pushdown_predicates",
+                        "pushdown_projections",
+                        "merge_subqueries",
+                        "simplify",
+                        "optimizer",
+                    }:
+                        for m in ("test_execute_tpcds", "test_execute_tpch", "test_execute_subqueries"):
+                            selected.update(nums_by_method.get(m, []))
+                # General dialect optimizer/transpile coverage
                 if is_dialect_module(rel_path):
                     stem = Path(rel_path).stem.lower()
+                    selected.update(nums_by_method.get("test_optimize", []))
+                    selected.update(nums_by_method.get("test_simplify", []))
                     for m in DIALECT_OPTIMIZER_METHODS.get(stem, ()):
                         selected.update(nums_by_method.get(m, []))
 
@@ -324,8 +332,8 @@ def main() -> None:
 
                 for h in fd["hunks"]:
                     old_s, old_e = align_hunk_span(src_lines_no_nl, h)
-                    q_s = max(1, old_s - 2)
-                    q_e = old_e + 2
+                    q_s = max(1, old_s - 3)
+                    q_e = old_e + 3
                     query_intervals.append((q_s, q_e))
 
                     if imp_ranges and range_intersects(imp_ranges, q_s, q_e):
@@ -346,21 +354,20 @@ def main() -> None:
                             if sc["kind"] == "class" and sc["start"] <= old_s and old_e <= sc["end"]:
                                 enclosing_cls = sc
                                 break
-                        if enclosing_cls is None:
-                            top_level_change = True
+                        if enclosing_cls is not None:
+                            query_intervals.append(
+                                (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 15))
+                            )
+                        top_level_change = True
 
                 if hit_import_time:
-                    noisy_nums = {
-                    n for m in NOISY_BENCH_METHODS for n in nums_by_method.get(m, [])
-                }
                     for cp in candidate_paths:
                         for test_file, imp_map in file_import_lines.items():
                             f_ranges = imp_map.get(cp, [])
                             if f_ranges and any(
                                 range_intersects(f_ranges, qs, qe) for qs, qe in query_intervals
-                                
                             ):
-                                tf_nums = tests_by_file.get(test_file, [])
+                                tf_nums = [n for n in tests_by_file.get(test_file, []) if n not in noisy_nums]
                                 if tf_nums:
                                     selected.add(min(tf_nums, key=lambda n: ms_by_num[n]))
 
@@ -370,20 +377,15 @@ def main() -> None:
                         if c_ranges and any(
                             range_intersects(c_ranges, qs, qe) for qs, qe in query_intervals
                         ):
-                            c_nums = tests_by_cls_prefix.get(cls_prefix, [])
+                            c_nums = [n for n in tests_by_cls_prefix.get(cls_prefix, []) if n not in noisy_nums]
                             if c_nums:
                                 selected.add(min(c_nums, key=lambda n: ms_by_num[n]))
-
-                matched_any_line = False
-                noisy_nums = {
-                    n for m in NOISY_BENCH_METHODS for n in nums_by_method.get(m, [])
-                }
 
                 matched_any_line = False
                 for cp in candidate_paths:
                     candidates = file_to_test_ranges.get(cp, [])
                     for tnum, ranges in candidates:
-                        if tnum in noisy_nums and not (rel_path == "sqlglot/generator.py" and top_level_change):
+                        if tnum in noisy_nums:
                             continue
                         for qs, qe in query_intervals:
                             if range_intersects(ranges, qs, qe):
@@ -392,20 +394,9 @@ def main() -> None:
                                 break
                     if top_level_change and candidates:
                         for tnum, ranges in candidates:
-                            if range_intersects(ranges, 1, 100):
-                                selected.add(tnum)
-                                matched_any_line = True
-                for cp in candidate_paths:
-                    candidates = file_to_test_ranges.get(cp, [])
-                    for tnum, ranges in candidates:
-                        for qs, qe in query_intervals:
-                            if range_intersects(ranges, qs, qe):
-                                selected.add(tnum)
-                                matched_any_line = True
-                                break
-                    if top_level_change and candidates:
-                        for tnum, ranges in candidates:
-                            if range_intersects(ranges, 1, 100):
+                            if tnum in noisy_nums:
+                                continue
+                            if range_intersects(ranges, 1, 150):
                                 selected.add(tnum)
                                 matched_any_line = True
 
@@ -414,11 +405,11 @@ def main() -> None:
                         stem = Path(rel_path).stem.lower()
                         dial_tf = f"tests/dialects/test_{stem}.py"
                         if dial_tf in tests_by_file:
-                            selected.update(tests_by_file[dial_tf])
+                            selected.update(n for n in tests_by_file[dial_tf] if n not in noisy_nums)
                     for tf in rel_tfs:
-                        selected.update(unmapped_by_file.get(tf, []))
+                        selected.update(n for n in unmapped_by_file.get(tf, []) if n not in noisy_nums)
                         selected.update(
-                            n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 5000
+                            n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 5000 and n not in noisy_nums
                         )
 
             # 2. Fixture / SQL / data files
@@ -462,7 +453,7 @@ def main() -> None:
                         selected.update(tnums)
 
         if need_serde_sweep:
-            serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", [])}
+            serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", []) if tnum not in noisy_nums}
             serde_set.update(tests_by_file.get("tests/test_serde.py", []))
             serde_set.update(nums_by_method.get("test_optimize", []))
             serde_set.update(nums_by_method.get("test_execute_tpcds", []))
