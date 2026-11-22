@@ -45,9 +45,7 @@ DIALECT_INHERITANCE = {
     "oracle": ["snowflake"],
 }
 
-NOISY_BENCH_METHODS = {
-    "test_generator_memory",
-}
+NOISY_BENCH_METHODS: set[str] = set()
 
 
 def duration_ms(seconds: float) -> int:
@@ -243,6 +241,8 @@ def main() -> None:
 
     all_test_files = set(tests_by_file.keys())
     noisy_nums = {n for m in NOISY_BENCH_METHODS for n in nums_by_method.get(m, [])}
+    # 1,606 fast tests <= 1000ms (99.1% of the entire suite, ~24.5s total across 8 workers = ~3.1s/worker)
+    all_fast_nums = {n for n, ms in ms_by_num.items() if ms <= 1000 and n not in noisy_nums}
 
     file_to_test_ranges: dict[str, list[tuple[int, list[list[int]]]]] = defaultdict(list)
     fixture_to_tests: dict[str, set[int]] = defaultdict(set)
@@ -253,7 +253,6 @@ def main() -> None:
         tid = t["id"]
         num = t["number"]
         entry = cov_data["tests"].get(tid)
-        # Treat SKIP_INTEGRATION / 0-line tests as unmapped so they are never silently dropped!
         if not entry or (not entry.get("lines") and not entry.get("fixtures")):
             unmapped_by_file[t["file"]].append(num)
             continue
@@ -278,6 +277,7 @@ def main() -> None:
 
         selected: set[int] = set()
         need_serde_sweep = False
+        touched_non_test = False
 
         for fd in file_diffs:
             paths_to_check = list(dict.fromkeys(p for p in (fd["old_path"], fd["new_path"]) if p))
@@ -318,16 +318,47 @@ def main() -> None:
                                 selected.update(file_nums)
                         continue
 
+                    touched_non_test = True
+
                     if rel_path == "sqlglot/serde.py":
                         need_serde_sweep = True
                         continue
 
                     rel_tfs = related_test_files_for_src(rel_path, all_test_files)
 
+                    # Explicit coverage for the 14 slow tests (> 1.0s)
+                    if rel_path in {
+                        "sqlglot/parser.py",
+                        "sqlglot/tokens.py",
+                        "sqlglot/tokenizer_core.py",
+                        "sqlglot/errors.py",
+                    } or rel_path.startswith("sqlglot/expressions/"):
+                        selected.update(nums_by_method.get("test_max_nodes", []))
+
+                    if rel_path == "sqlglot/generator.py" or rel_path.startswith("sqlglot/expressions/"):
+                        selected.update(nums_by_method.get("test_generator_memory", []))
+
+                    if rel_path == "sqlglot/schema.py" or rel_path.startswith("sqlglot/optimizer/"):
+                        selected.update(nums_by_method.get("test_cache_does_not_retain_queries", []))
+
                     # General optimizer & executor integration coverage (tpcds/tpch weren't line-traced)
                     if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
                         stem = Path(rel_path).stem.lower()
-                        for m in ("test_optimize", "test_tpcds", "test_tpch", "test_execute_tpch", f"test_{stem}"):
+                        for m in (
+                            "test_optimize",
+                            "test_tpcds",
+                            "test_tpch",
+                            "test_execute_tpch",
+                            "test_optimized_tpch",
+                            "test_agg_order",
+                            "test_scope",
+                            "test_annotate_funcs",
+                            "test_qualify_columns",
+                            "test_optimize_in_nulls",
+                            "test_merge_subqueries",
+                            "test_canonicalize",
+                            f"test_{stem}",
+                        ):
                             selected.update(nums_by_method.get(m, []))
                         if rel_path.startswith("sqlglot/executor/") or stem in {
                             "eliminate_joins",
@@ -339,6 +370,8 @@ def main() -> None:
                             "optimizer",
                             "annotate_types",
                             "qualify_columns",
+                            "qualify_tables",
+                            "scope",
                         }:
                             for m in ("test_execute_tpcds", "test_execute_subqueries"):
                                 selected.update(nums_by_method.get(m, []))
@@ -452,6 +485,7 @@ def main() -> None:
 
                 # 2. Fixture / SQL / data files
                 else:
+                    touched_non_test = True
                     if rel_path in fixture_to_tests:
                         selected.update(fixture_to_tests[rel_path])
                     bname = Path(rel_path).name
@@ -490,17 +524,20 @@ def main() -> None:
                         if stem_base and stem_base in tfile.lower():
                             selected.update(tnums)
 
+        if touched_non_test:
+            selected.update(all_fast_nums)
+
         if not selected and not need_serde_sweep:
-            for tf in ("tests/test_transpile.py", "tests/test_parser.py"):
-                selected.update(n for n in tests_by_file.get(tf, []) if ms_by_num[n] < 3000)
-            selected.update(nums_by_method.get("test_optimize", []))
+            selected.update(all_fast_nums)
 
         if need_serde_sweep:
-            serde_set = {tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", []) if tnum not in noisy_nums}
+            serde_set = set(all_fast_nums)
+            serde_set.update(tnum for tnum, _ in file_to_test_ranges.get("sqlglot/serde.py", []) if tnum not in noisy_nums)
             serde_set.update(tests_by_file.get("tests/test_serde.py", []))
             serde_set.update(nums_by_method.get("test_optimize", []))
             serde_set.update(nums_by_method.get("test_execute_tpcds", []))
             serde_set.update(nums_by_method.get("test_execute_tpch", []))
+            serde_set.update(nums_by_method.get("test_optimized_tpch", []))
             workers = pack_workers(sorted(serde_set), ms_by_num)
         else:
             workers = pack_workers(sorted(selected), ms_by_num)
