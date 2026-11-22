@@ -301,12 +301,6 @@ def main() -> None:
         patch_text = patch_path.read_text("utf-8", errors="replace")
         file_diffs = parse_unified_diff(patch_text)
 
-        if is_comment_only_py_diff(file_diffs):
-            out_lines.append(
-                json.dumps({"commit": commit_id, "workers": []}, separators=(",", ":"))
-            )
-            continue
-
         selected: set[int] = set()
         need_serde_sweep = False
 
@@ -384,10 +378,18 @@ def main() -> None:
                         selected.update(tests_by_file.get("tests/test_serde.py", []))
                         selected.update(nums_by_method.get("test_identity", []))
 
-                    # Optimizer & executor integration coverage (only run heavy TPC-DS/TPC-H on join/subquery/executor rules)
+                    # Optimizer & executor integration coverage
                     if rel_path.startswith(("sqlglot/optimizer/", "sqlglot/executor/")):
                         stem = Path(rel_path).stem.lower()
-                        for m in ("test_optimize", "test_tpch", f"test_{stem}"):
+                        for m in (
+                            "test_optimize",
+                            "test_tpch",
+                            "test_execute_tpch",
+                            "test_optimized_tpch",
+                            "test_execute_subqueries",
+                            "test_agg_order",
+                            f"test_{stem}",
+                        ):
                             selected.update(nums_by_method.get(m, []))
                         if rel_path.startswith("sqlglot/executor/") or stem in {
                             "eliminate_joins",
@@ -397,14 +399,7 @@ def main() -> None:
                             "merge_subqueries",
                             "unnest_subqueries",
                         }:
-                            for m in (
-                                "test_execute_tpcds",
-                                "test_execute_tpch",
-                                "test_optimized_tpch",
-                                "test_tpcds",
-                                "test_execute_subqueries",
-                                "test_agg_order",
-                            ):
+                            for m in ("test_execute_tpcds", "test_tpcds"):
                                 selected.update(nums_by_method.get(m, []))
 
                     # General dialect optimizer/transpile coverage
@@ -449,6 +444,7 @@ def main() -> None:
                                     enclosing_cls = sc
                                     break
                             if enclosing_cls is not None:
+                                hit_import_time = True
                                 query_intervals.append(
                                     (enclosing_cls["start"], min(enclosing_cls["end"], enclosing_cls["start"] + 10))
                                 )
@@ -458,14 +454,43 @@ def main() -> None:
                         for tf in rel_tfs:
                             selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
                         if rel_path.startswith("sqlglot/expressions/"):
-                            for tf in all_test_files:
-                                if tf.startswith("tests/dialects/test_") or tf in {
-                                    "tests/test_expressions.py",
-                                    "tests/test_parser.py",
-                                    "tests/test_generator.py",
-                                    "tests/test_transpile.py",
-                                }:
-                                    selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
+                            for tf in (
+                                "tests/test_expressions.py",
+                                "tests/test_parser.py",
+                                "tests/test_generator.py",
+                                "tests/test_transpile.py",
+                            ):
+                                selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
+                            edited_classes = {
+                                sc["name"]
+                                for h in fd["hunks"]
+                                for sc in scopes
+                                if sc["kind"] == "class"
+                                and not (sc["end"] < align_hunk_span(src_lines_no_nl, h)[0] or sc["start"] > align_hunk_span(src_lines_no_nl, h)[1])
+                            }
+                            if edited_classes:
+                                expr_dir = REPO_DIR / "sqlglot" / "expressions"
+                                if expr_dir.exists():
+                                    sub_pat = re.compile(r"class\s+(\w+)\s*\([^)]*\b(?:" + "|".join(re.escape(c) for c in edited_classes) + r")\b")
+                                    for ep in expr_dir.glob("*.py"):
+                                        edited_classes.update(sub_pat.findall(ep.read_text("utf-8", errors="ignore")))
+                                cls_pat = re.compile(r"\b(?:" + "|".join(re.escape(c) for c in edited_classes) + r")\b")
+                                matched_dialects: set[str] = set()
+                                for sub in ("dialects", "parsers", "generators"):
+                                    sub_dir = REPO_DIR / "sqlglot" / sub
+                                    if sub_dir.exists():
+                                        for df_py in sub_dir.glob("*.py"):
+                                            if df_py.stem not in {"__init__", "dialect"} and cls_pat.search(df_py.read_text("utf-8", errors="ignore")):
+                                                matched_dialects.add(df_py.stem.lower())
+                                                matched_dialects.update(DIALECT_INHERITANCE.get(df_py.stem.lower(), ()))
+                                for d in matched_dialects:
+                                    cand = f"tests/dialects/test_{d}.py"
+                                    if cand in tests_by_file:
+                                        selected.update(n for n in tests_by_file[cand] if n not in noisy_nums)
+                            else:
+                                for tf in all_test_files:
+                                    if tf.startswith("tests/dialects/test_"):
+                                        selected.update(n for n in tests_by_file.get(tf, []) if n not in noisy_nums)
                         for cp in candidate_paths:
                             for test_file, imp_map in file_import_lines.items():
                                 f_ranges = imp_map.get(cp, [])
@@ -475,7 +500,7 @@ def main() -> None:
                                     selected.update(
                                         n
                                         for n in tests_by_file.get(test_file, [])
-                                        if ms_by_num[n] < 1500 and n not in noisy_nums
+                                        if n not in noisy_nums
                                     )
 
                     for cp in candidate_paths:

@@ -98,7 +98,7 @@ def class_to_pytest_prefix(cls: type, repo_root: Path) -> str:
 
 def trace_test_files(args: tuple[str, list[str]]) -> dict:
     repo_str, test_rel_paths = args
-    os.environ.pop("SKIP_INTEGRATION", None)
+    os.environ["SKIP_INTEGRATION"] = "0"
     repo_root = Path(repo_str).resolve()
     sys.path.insert(0, str(repo_root))
     os.chdir(repo_root)

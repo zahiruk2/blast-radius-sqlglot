@@ -20,9 +20,11 @@ RUN git clone https://github.com/tobymao/sqlglot.git /app/repo \
     && pip install --no-cache-dir --no-deps -e /app/repo
 
 COPY build_map.py /app/build_map.py
-COPY selector.py /app/selector.py
 
+ENV SKIP_INTEGRATION=0
 RUN python3 /app/build_map.py /app/repo /app/coverage_map.json \
     && rm -rf /app/repo/.git
+
+COPY selector.py /app/selector.py
 
 CMD ["python", "/app/selector.py"]
